@@ -1,0 +1,9 @@
+{
+ "version": 1,
+ "files": {
+  "agg.py": "f8b39c9904f936e481a2b7a2770cc0ef236b51f6eace351c1793262535a7865f",
+  "channels.py": "38b6707bc270ee5b7197d64e47602b7577a840961d2d25aa47a90401d5caa829",
+  "config.json": "7e104d46704f6decde38a3282ba9fc5f2c58b558214087b89a2158838751a1ad",
+  "run.sh": "c158caf59461d63c6c54e4e776acf9549bdf98cc436c8f1975a00f55fbe1bca0"
+ }
+}

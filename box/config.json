@@ -1,0 +1,26 @@
+{
+  "sources": [
+    "de0",
+    "ss",
+    "so",
+    "rut",
+    "runtv",
+    "rurt",
+    "d1m2",
+    "d4",
+    "https://iptv-org.github.io/iptv/countries/ru.m3u"
+  ],
+  "epg": "https://iptvx.one/epg/epg_lite.xml.gz",
+  "out_dir": "out",
+  "state": "state.json",
+  "main_every_min": 30,
+  "all_every_min": 120,
+  "full_every_min": 720,
+  "workers": 12,
+  "retest_top": 3,
+  "listen": "127.0.0.1",
+  "port": 8090,
+  "restart_flag": "/sdcard/iptv-agg/restart",
+  "update_url": "https://raw.githubusercontent.com/viafoggy-dotcom/tvbox-iptv/main/box",
+  "update_every_min": 720
+}
