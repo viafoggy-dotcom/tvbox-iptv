@@ -487,6 +487,8 @@ def check_update(cfg):
         if hashlib.sha256(data).hexdigest() != sha:
             raise ValueError(f"{fn}: sha256 не совпал")
         open(os.path.join("next", fn), "wb").write(data)
+        if fn.endswith(".sh"):
+            os.chmod(os.path.join("next", fn), 0o755)
     for fn in ("agg.py", "channels.py", "config.json"):   # недостающее — из текущей версии
         if not os.path.exists(os.path.join("next", fn)):
             shutil.copy(fn, "next")

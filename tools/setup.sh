@@ -20,11 +20,12 @@ done
 python -c 'import json; print(json.load(open("manifest.json"))["version"])' > version
 python agg.py config.json --selftest || { echo "SETUP FAILED: selftest"; exit 1; }
 chmod +x run.sh
-# exec, не «nohup … &»: Termux:Boot убивает фоновые процессы, когда скрипт завершается
+# exec, не «nohup … &»: Termux:Boot убивает фоновые процессы, когда скрипт завершается;
+# через sh — обновление перезаписывает run.sh без права на выполнение
 cat > ~/.termux/boot/iptv-agg <<'EOF'
 #!/data/data/com.termux/files/usr/bin/sh
 termux-wake-lock
-exec ~/iptv-agg/run.sh >/dev/null 2>&1
+exec sh ~/iptv-agg/run.sh >/dev/null 2>&1
 EOF
 chmod +x ~/.termux/boot/iptv-agg
 pkill -f iptv-agg/run.sh; pkill -f "agg.py config.json"

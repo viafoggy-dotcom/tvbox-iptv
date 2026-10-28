@@ -10,6 +10,7 @@ while true; do
         # через временный файл + mv: работающий sh продолжает читать старый run.sh, а не переписанный на ходу
         for f in next/*; do cp "$f" "$f.tmp" && mv "$f.tmp" "./$(basename $f)"; done
         rm -rf next
+        chmod +x run.sh
         echo "$(date '+%m-%d %H:%M:%S') обновлено до версии $(cat version)" >> agg.log
         exec sh ~/iptv-agg/run.sh
     fi
