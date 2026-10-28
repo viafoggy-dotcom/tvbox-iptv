@@ -195,6 +195,7 @@ def probe(e, seg_bytes=SEG_SMALL):
                 else:
                     res["err"] = f"не поток ({ctype or 'нет типа'})"
                 break
+            res["hls"] = True
             lines = text.splitlines()
             if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
                 vars_ = []
@@ -347,7 +348,7 @@ class Agg:
         def key(c):   # группы основных — первыми; внутри группы сначала основные по каталогу, затем по алфавиту
             return (gorder.get(c["group"], 99), c["group"], 0 if c["main"] else 1, c["main"][0] if c["main"] else 0, c["name"].lower())
 
-        report, main_lines, all_lines = [], [], []
+        report, main_lines, all_lines, player = [], [], [], []
         for c in sorted(self.chans.values(), key=key):
             url = self.chosen.get(c["key"])
             best = next((e for e in c["cand"] if e["url"] == url), None)
@@ -372,6 +373,13 @@ class Agg:
                 lines.append(f"#EXTVLCOPT:http-referrer={best['ref']}")
             lines.append(url)
             all_lines += lines
+            # для своего плеера: выбранный поток первым, затем живые запасные по убыванию качества
+            alive = sorted((e for e in c["cand"] if self.last.get(e["url"], {}).get("ok")),
+                           key=lambda e: (e["url"] == url, self.score(e, url)), reverse=True)[:5]
+            player.append({"n": len(player) + 1, "name": c["name"], "group": c["group"], "main": bool(c["main"]),
+                           "tvg": c["tvg"].get("id", ""), "logo": c["tvg"].get("logo", ""),
+                           "streams": [{"url": e["url"], "ua": e["ua"] or "", "ref": e["ref"] or "",
+                                        "hls": bool(self.last[e["url"]].get("hls"))} for e in alive]})
             if c["main"]:
                 main_lines += lines
         for fn, ls in (("main.m3u", main_lines), ("playlist.m3u", all_lines)):
@@ -379,6 +387,10 @@ class Agg:
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join([hdr] + ls) + "\n")
             os.replace(tmp, os.path.join(out, fn))
+        tmp = os.path.join(out, "channels.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"updated": int(time.time()), "epg": cfg["epg"], "channels": player}, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, os.path.join(out, "channels.json"))
         status = {"updated": time.strftime("%Y-%m-%d %H:%M:%S"), "took_s": took, "channels": report}
         json.dump(status, open(os.path.join(out, "status.json"), "w"), ensure_ascii=False, indent=1)
         with open(os.path.join(out, "status.html"), "w", encoding="utf-8") as f:
