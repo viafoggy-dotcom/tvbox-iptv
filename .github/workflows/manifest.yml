@@ -1,0 +1,28 @@
+name: manifest
+# После правки файлов в box/: самопроверка, затем новая версия в box/manifest.json.
+# Приставка увидит её при следующей проверке обновлений (раз в 12 ч).
+on:
+  push:
+    branches: [main]
+    paths: ["box/**", "!box/manifest.json"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: selftest
+        working-directory: box
+        run: python agg.py config.json --selftest
+      - name: manifest
+        run: |
+          python tools/manifest.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add box/manifest.json
+          git diff --cached --quiet || (git commit -m "manifest: версия $(python -c 'import json;print(json.load(open("box/manifest.json"))["version"])')" && git push)
