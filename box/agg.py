@@ -44,7 +44,7 @@ def log(*a):
 # ---------- названия ----------
 
 SHIFT = re.compile(r"(\+\s?\d+|\bмск\s?[+-]\s?\d+|\bmsk\s?[+-]\s?\d+)", re.I)
-TAGS = re.compile(r"\b(hd|fhd|uhd|sd|4k|8k|hevc|h265|orig|original|50fps|tv|тв(?=\s*$)|live|online|лайт|резерв|backup|\d{3,4}p)\b", re.I)
+TAGS = re.compile(r"\b(hd|fhd|uhd|sd|4k|8k|hevc|h265|orig|original|50fps|(?:tv|тв)(?=\s*$)|live|online|лайт|резерв|backup|\d{3,4}p)\b", re.I)
 
 
 def norm(name):
