@@ -136,16 +136,55 @@ def parse_m3u(text, src):
 
 
 def load_sources(cfg):
-    entries = []
+    """Источники с копией последней удачной версии: при сбое m3u.su идём по запомненному
+    настоящему адресу, а если и он не отвечает (или источник удалён) — берём копию."""
+    cdir = cfg.get("source_cache", "sources")
+    keep = cfg.get("source_cache_days", 60) * 86400
+    os.makedirs(cdir, exist_ok=True)
+    meta_path = os.path.join(cdir, "meta.json")
+    try:
+        meta = json.load(open(meta_path))
+    except Exception:
+        meta = {}
+    entries, m3u_down = [], False
     for s in cfg["sources"]:
         url = s if s.startswith("http") else f"https://m3u.su/{s}"
-        try:
-            body, real, _ = fetch(url, timeout=30)
-            e = parse_m3u(body.decode("utf-8", "replace"), s)
-            entries += e
-            log(f"источник {s}: {len(e)} записей")
-        except Exception as ex:
-            log(f"источник {s}: ошибка {ex}")
+        path = os.path.join(cdir, re.sub(r"[^\w.-]", "_", s)[-80:] + ".m3u")
+        real = meta.get(s, {}).get("real")
+        text, err = None, None
+        tries = [url] + ([real] if real and real != url else [])
+        if m3u_down and real:
+            tries = [real]   # m3u.su уже не ответил в этом проходе — не ждём таймаут снова
+        for u in tries:
+            try:
+                body, got, _ = fetch(u, timeout=30)
+                t = body.decode("utf-8", "replace")
+                if "#EXTINF" not in t:
+                    raise ValueError("ответ без каналов")
+                text = t
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    f.write(t)
+                os.replace(path + ".tmp", path)
+                meta[s] = {"real": got, "t": int(time.time())}
+                break
+            except Exception as ex:
+                err = ex
+                if "m3u.su/" in u and not isinstance(ex, urllib.error.HTTPError):
+                    m3u_down = True
+        if text is None:
+            age = time.time() - meta.get(s, {}).get("t", 0)
+            if os.path.exists(path) and age < keep:
+                text = open(path, encoding="utf-8").read()
+                log(f"источник {s}: недоступен ({err}), копия от {time.strftime('%d.%m %H:%M', time.localtime(meta[s]['t']))}")
+            else:
+                log(f"источник {s}: ошибка {err}, копии нет")
+                continue
+        e = parse_m3u(text, s)
+        entries += e
+        log(f"источник {s}: {len(e)} записей")
+    with open(meta_path + ".tmp", "w") as f:
+        json.dump(meta, f)
+    os.replace(meta_path + ".tmp", meta_path)
     return entries
 
 

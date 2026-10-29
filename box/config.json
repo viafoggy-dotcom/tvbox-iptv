@@ -22,5 +22,7 @@
   "port": 8090,
   "restart_flag": "/sdcard/iptv-agg/restart",
   "update_url": "https://raw.githubusercontent.com/viafoggy-dotcom/tvbox-iptv/main/box",
-  "update_every_min": 720
+  "update_every_min": 720,
+  "source_cache": "/sdcard/iptv-agg/sources",
+  "source_cache_days": 60
 }
