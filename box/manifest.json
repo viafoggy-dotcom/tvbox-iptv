@@ -1,9 +1,9 @@
 {
- "version": 6,
+ "version": 7,
  "files": {
-  "agg.py": "c89862cd6dae2e0542deba91311c632de376ea8af981d01e828fd1450729b2f2",
+  "agg.py": "68544e4356924cae29bbaa46a21f6a9983c7b1b59f365e126546c4a025901b53",
   "channels.py": "ea22bed6ae268716017dc0eae3e2968c6e521e4fc4fea883aba8363a0d28d5d7",
-  "config.json": "e5fe178693cf5de1a2d656a0cfa34b6ea57135374bf883eda46c421b908b3a92",
-  "run.sh": "ce823bb806e532b05c9f5b5f325bcc7f542e0ceaee32c57047b60bfcc67791df"
+  "config.json": "2ae9c00c15eed11b29dd6976c5c2e45c4d6ae0a9fe57e4a955121c5c674a3773",
+  "run.sh": "8546802117ffa50735bf60a0e50d3e2e162d5f200d06480a2fb0b83fde8edd96"
  }
 }
