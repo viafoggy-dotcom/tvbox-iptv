@@ -28,5 +28,6 @@
   "source_cache_days": 60,
   "player_streams": 10,
   "step_max_min": 30,
-  "log_copy": "/sdcard/iptv-agg/agg.log"
+  "log_copy": "/sdcard/iptv-agg/agg.log",
+  "kinozals": "https://smotret-online.tv/kinozals.html"
 }

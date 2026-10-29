@@ -10,6 +10,7 @@
   full_every_min  — заново скачать источники, проверить все варианты, переизбрать лучших
 
 Отдаёт: /playlist.m3u (основные, затем все остальные), /main.m3u, /status, /status.json.
+Кинозалы smotret-online.tv (ключ kinozals в config) — группой в конце playlist.m3u, потоки через /kz/.
 """
 import concurrent.futures as cf
 import gzip
@@ -25,7 +26,7 @@ import threading
 import time
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 from channels import MAIN
 
@@ -271,6 +272,185 @@ def probe(e, seg_bytes=SEG_SMALL):
     return res
 
 
+# ---------- кинозалы smotret-online.tv ----------
+# Ссылки на потоки подписаны и живут около часа, поэтому в плейлисте — адрес этого сервера:
+# /kz/<slug>.m3u8 добывает свежую ссылку (страница → iframe плеера → m3u8) и проксирует поток
+# с заголовками браузера: без них плеер cdntvmedia отвечает 403 (как и на IP датацентров).
+
+KZ_GROUP = "Кинозалы"
+KZ_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+         "(KHTML, like Gecko) Version/18.6 Safari/605.1.15")
+KZ_IFRAME = re.compile(r'<iframe[^>]+src=["\']([^"\']+)["\']', re.I)
+KZ_M3U8 = re.compile(r'https?:(?:\\?/){2}[^"\'\s<>]+?\.m3u8[^"\'\s<>]*', re.I)
+
+
+def kz_origin(url):
+    p = urlsplit(url)
+    return f"{p.scheme}://{p.netloc}"
+
+
+def kz_page(url, referer=None):
+    """Страница так, как её грузит Safari: документом или iframe (Referer чужому сайту — только origin)."""
+    h = {"User-Agent": KZ_UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "ru",
+         "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe" if referer else "document", "Sec-Fetch-Site": "none"}
+    if referer:
+        same = kz_origin(referer) == kz_origin(url)
+        h["Referer"] = referer if same else kz_origin(referer) + "/"
+        h["Sec-Fetch-Site"] = "same-origin" if same else "cross-site"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=15) as r:
+        return r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
+
+
+def kz_open(url, ref, timeout=15):
+    """Поток или сегмент: CDN ждёт Origin/Referer плеера, со страницы которого взята ссылка."""
+    o = kz_origin(ref)
+    h = {"User-Agent": KZ_UA, "Accept": "*/*", "Accept-Language": "ru", "Origin": o, "Referer": o + "/"}
+    return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+
+
+def kz_channels(index):
+    page = kz_page(index)
+    out, seen = [], set()
+    for m in re.finditer(r'<div class="tv-schedule"([^>]+)>', page):
+        a = dict(re.findall(r'data-([\w-]+)="([^"]*)"', m.group(1)))
+        slug = a.get("link", "").rsplit("/", 1)[-1].removesuffix(".html")
+        if re.fullmatch(r"[\w-]+", slug) and slug not in seen:
+            seen.add(slug)
+            out.append({"slug": slug, "page": urljoin(index, a["link"]), "logo": a.get("logo", ""),
+                        "name": html.unescape(a.get("custom-name") or a.get("channel-id") or slug), "ok": None})
+    return out
+
+
+def kz_resolve(page):
+    """Страница канала → вложенные iframe → первая ссылка на m3u8. Возвращает (m3u8, адрес плеера)."""
+    url, ref = page, None
+    for _ in range(5):
+        text = kz_page(url, ref)
+        m = KZ_M3U8.search(text)
+        if m:
+            return m.group(0).replace("\\/", "/"), url
+        frames = [urljoin(url, html.unescape(s)) for s in KZ_IFRAME.findall(text)]
+        frames = [f for f in frames if not re.search(r"google|yandex|adfinity", f)]
+        if not frames:
+            raise LookupError(f"нет ссылки на поток: {url}")
+        url, ref = frames[0], url
+    raise LookupError(f"слишком глубокие iframe: {page}")
+
+
+def kz_expiry(link):
+    """/<подпись>/<канал>/<unix-срок>/index.m3u8 или ?wmsAuthSign=<подпись>-<unix-срок>-…"""
+    p = urlsplit(link)
+    for part in p.path.split("/") + parse_qs(p.query).get("wmsAuthSign", [""])[0].split("-"):
+        if re.fullmatch(r"1\d{9}", part):
+            return int(part)
+    return None
+
+
+class KzLinks:
+    """Свежие ссылки по каналам; живут до срока из подписи минус 2 мин."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pages, self.links = {}, {}
+
+    def get(self, slug):
+        now = time.time()
+        with self.lock:
+            hit = self.links.get(slug)
+            page = self.pages.get(slug)
+        if hit and hit[2] > now:
+            return hit[0], hit[1]
+        if not page:
+            raise LookupError(f"неизвестный кинозал {slug}")
+        link, ref = kz_resolve(page)
+        exp = kz_expiry(link)
+        ttl = min(exp - now - 120, 3600) if exp else 600
+        with self.lock:
+            self.links[slug] = (link, ref, now + max(ttl, 30))
+        return link, ref
+
+    def drop(self, slug):
+        with self.lock:
+            self.links.pop(slug, None)
+
+
+KZ = KzLinks()
+
+
+def kz_rewrite(text, base_url, ref, local, slug):
+    """Все адреса плейлиста — через нас. Варианты master-плейлиста ссылаются на /kz/<slug>.m3u8?v=N,
+    чтобы при обновлении плейлиста подпись бралась свежая, а не та, что была при старте."""
+    def wrap(u):
+        return f"{local}/kz/r?u={quote(urljoin(base_url, u), safe='')}&ref={quote(ref, safe='')}"
+    master = "#EXT-X-STREAM-INF" in text
+    out, var = [], 0
+    for line in text.splitlines():
+        if line.startswith("#"):
+            line = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{wrap(m.group(1))}"', line)
+        elif line.strip():
+            line = f"{local}/kz/{slug}.m3u8?v={var}" if master else wrap(line.strip())
+            var += master
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def kz_handle(h):
+    """GET /kz/<slug>.m3u8[?v=N] — плейлист канала; /kz/r?u=…&ref=… — сегменты и ключи."""
+    path, _, query = h.path.partition("?")
+    q = parse_qs(query)
+    local = f"http://{h.headers.get('Host')}"
+
+    def send(body, ctype, code=200):
+        h.send_response(code)
+        h.send_header("Content-Type", ctype)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    def playlist(slug, v):
+        link, ref = KZ.get(slug)
+        with kz_open(link, ref) as r:
+            url, text = r.geturl(), r.read().decode("utf-8", "replace")
+        if v is not None and "#EXT-X-STREAM-INF" in text:
+            variants = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
+            url = urljoin(url, variants[min(int(v), len(variants) - 1)])
+            with kz_open(url, ref) as r:
+                url, text = r.geturl(), r.read().decode("utf-8", "replace")
+        send(kz_rewrite(text, url, ref, local, slug).encode(), "application/vnd.apple.mpegurl")
+
+    try:
+        m = re.fullmatch(r"/kz/([\w-]+)\.m3u8", path)
+        if m:
+            try:
+                return playlist(m[1], q.get("v", [None])[0])
+            except urllib.error.HTTPError:
+                KZ.drop(m[1])   # подпись истекла раньше срока или сменился IP — добываем заново
+                return playlist(m[1], q.get("v", [None])[0])
+        if path == "/kz/r" and "u" in q:
+            ref = q.get("ref", [""])[0]
+            with kz_open(q["u"][0], ref, timeout=20) as r:
+                ctype = r.headers.get("Content-Type", "")
+                if "mpegurl" in ctype.lower() or r.geturl().split("?")[0].endswith(".m3u8"):
+                    text = r.read().decode("utf-8", "replace")
+                    return send(kz_rewrite(text, r.geturl(), ref, local, "").encode(), "application/vnd.apple.mpegurl")
+                h.send_response(200)
+                h.send_header("Content-Type", ctype or "video/mp2t")
+                if r.headers.get("Content-Length"):
+                    h.send_header("Content-Length", r.headers["Content-Length"])
+                h.end_headers()
+                shutil.copyfileobj(r, h.wfile, 65536)
+                return
+        send(b"not found\n", "text/plain", 404)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    except Exception as ex:
+        log(f"кинозал {h.path[:80]}: {ex!r}")
+        try:
+            send(f"{ex}\n".encode(), "text/plain", 502)
+        except OSError:
+            pass
+
+
 # ---------- состояние и выбор ----------
 
 class Agg:
@@ -285,6 +465,7 @@ class Agg:
         self.last = d.get("last", {})        # url → результат последней проверки
         self.chosen = d.get("chosen", {})    # канал → url
         self.chans = {}
+        self.kz = []                         # кинозалы: [{"slug", "name", "logo", "page", "ok"}]
         self.lock = threading.Lock()
         self.busy_since = 0
 
@@ -360,6 +541,35 @@ class Agg:
         self.last = {u: r for u, r in self.last.items() if u in live}
         for c in chans.values():
             self.pick(c)
+        self.kz_refresh()
+
+    def kz_refresh(self):
+        """Список кинозалов со страницы и проверка, что у каждого добывается живой плейлист."""
+        index = self.cfg.get("kinozals")
+        if not index:
+            self.kz = []
+            return
+        try:
+            kz = kz_channels(index)
+        except Exception as ex:
+            log(f"кинозалы: список недоступен ({ex!r}), оставляю прошлый")
+            return
+        with KZ.lock:
+            KZ.pages = {c["slug"]: c["page"] for c in kz}
+
+        def check(c):
+            try:
+                link, ref = KZ.get(c["slug"])
+                with kz_open(link, ref) as r:
+                    return b"#EXTM3U" in r.read(4096)
+            except Exception:
+                KZ.drop(c["slug"])
+                return False
+        with cf.ThreadPoolExecutor(min(self.cfg.get("workers", 12), 6)) as ex:
+            for c, ok in zip(kz, ex.map(check, kz)):
+                c["ok"] = ok
+        self.kz = kz
+        log(f"кинозалы: живых {sum(c['ok'] for c in kz)} из {len(kz)}")
 
     def recheck(self, main_only):
         """Перечитать источники (ссылки с токенами меняются), проверить новые ссылки и текущие потоки;
@@ -422,6 +632,21 @@ class Agg:
                                         "hls": bool(self.last[e["url"]].get("hls"))} for e in alive]})
             if c["main"]:
                 main_lines += lines
+        # кинозалы: если не прошёл ни один (сайт лёг на время проверки) — оставляем все, адреса-то наши
+        local = cfg.get("kz_base") or f"http://127.0.0.1:{cfg.get('port', 8090)}"
+        any_ok = any(c["ok"] for c in self.kz)
+        for c in self.kz:
+            url = f"{local}/kz/{c['slug']}.m3u8"
+            report.append({"channel": c["name"], "group": KZ_GROUP, "main": False, "ok": bool(c["ok"]),
+                           "alive": int(bool(c["ok"])), "total": 1, "url": url, "src": "smotret-online",
+                           "height": 0, "need": 0, "got": 0, "ms": 0, "rate": 1 if c["ok"] else 0,
+                           "errors": [] if c["ok"] else ["ссылка не добыта"]})
+            if any_ok and not c["ok"]:
+                continue
+            all_lines += [f'#EXTINF:-1 tvg-id="{c["slug"]}" tvg-name="{c["name"]}" tvg-logo="{c["logo"]}" '
+                          f'group-title="{KZ_GROUP}",{c["name"]}', url]
+            player.append({"n": len(player) + 1, "name": c["name"], "group": KZ_GROUP, "main": False,
+                           "tvg": c["slug"], "logo": c["logo"], "streams": [{"url": url, "ua": "", "ref": "", "hls": True}]})
         for fn, ls in (("main.m3u", main_lines), ("playlist.m3u", all_lines)):
             tmp = os.path.join(out, fn + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
@@ -492,6 +717,8 @@ def serve(cfg):
             super().__init__(*a, directory=out, **k)
 
         def do_GET(self):
+            if self.path.startswith("/kz/"):
+                return kz_handle(self)
             if self.path in ("/", "/status"):
                 self.path = "/status.html"
             super().do_GET()
@@ -563,6 +790,10 @@ def selftest(cfg):
     """Новая версия должна импортироваться, разбирать m3u и сводить синонимы."""
     e = parse_m3u('#EXTM3U\n#EXTINF:-1 group-title="Эфирные",Первый канал HD\nhttp://x/1.m3u8\n', "t")
     assert e and ALIAS[norm(e[0]["name"])][2] == "Первый канал"
+    assert kz_expiry("https://x/2051/index.m3u8?wmsAuthSign=ab-1793284083-1i2") == 1793284083
+    assert kz_expiry("https://x/sig/2051/1793298074/index.m3u8") == 1793298074
+    pl = kz_rewrite("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi/index.m3u8\n", "https://c/2051/index.m3u8", "https://p/x", "http://l", "s")
+    assert "http://l/kz/s.m3u8?v=0" in pl
     assert cfg["sources"] and cfg["out_dir"]
     Agg(dict(cfg, state="/nonexistent/state.json"))
     print("selftest ok")
