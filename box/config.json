@@ -8,12 +8,13 @@
     "rurt",
     "d1m2",
     "d4",
-    "https://iptv-org.github.io/iptv/countries/ru.m3u"
+    "https://iptv-org.github.io/iptv/countries/ru.m3u",
+    "https://iptv-org.github.io/iptv/languages/rus.m3u"
   ],
   "epg": "https://iptvx.one/epg/epg_lite.xml.gz",
   "out_dir": "out",
   "state": "state.json",
-  "main_every_min": 30,
+  "main_every_min": 15,
   "all_every_min": 120,
   "full_every_min": 720,
   "workers": 12,
@@ -24,5 +25,8 @@
   "update_url": "https://raw.githubusercontent.com/viafoggy-dotcom/tvbox-iptv/main/box",
   "update_every_min": 720,
   "source_cache": "/sdcard/iptv-agg/sources",
-  "source_cache_days": 60
+  "source_cache_days": 60,
+  "player_streams": 10,
+  "step_max_min": 30,
+  "log_copy": "/sdcard/iptv-agg/agg.log"
 }

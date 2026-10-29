@@ -286,6 +286,7 @@ class Agg:
         self.chosen = d.get("chosen", {})    # канал → url
         self.chans = {}
         self.lock = threading.Lock()
+        self.busy_since = 0
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -414,7 +415,7 @@ class Agg:
             all_lines += lines
             # для своего плеера: выбранный поток первым, затем живые запасные по убыванию качества
             alive = sorted((e for e in c["cand"] if self.last.get(e["url"], {}).get("ok")),
-                           key=lambda e: (e["url"] == url, self.score(e, url)), reverse=True)[:5]
+                           key=lambda e: (e["url"] == url, self.score(e, url)), reverse=True)[:cfg.get("player_streams", 10)]
             player.append({"n": len(player) + 1, "name": c["name"], "group": c["group"], "main": bool(c["main"]),
                            "tvg": c["tvg"].get("id", ""), "logo": c["tvg"].get("logo", ""),
                            "streams": [{"url": e["url"], "ua": e["ua"] or "", "ref": e["ref"] or "",
@@ -435,17 +436,30 @@ class Agg:
         with open(os.path.join(out, "status.html"), "w", encoding="utf-8") as f:
             f.write(status_html(status))
         self.save()
+        if cfg.get("log_copy") and os.path.exists("agg.log"):   # журнал виден через adb без перезапуска
+            try:
+                with open("agg.log", "rb") as f:
+                    f.seek(max(0, os.path.getsize("agg.log") - 200_000))
+                    data = f.read()
+                with open(cfg["log_copy"] + ".tmp", "wb") as f:
+                    f.write(data)
+                os.replace(cfg["log_copy"] + ".tmp", cfg["log_copy"])
+            except OSError:
+                pass
         m = [x for x in report if x["main"]]
         log(f"записано: основные {sum(x['ok'] for x in m)}/{len(m)}, всего {sum(x['ok'] for x in report)}/{len(report)}")
 
     def step(self, level):
-        t0 = time.time()
-        with self.lock:
-            if level == "full" or not self.chans:
-                self.full()
-            else:
-                self.recheck(main_only=(level == "main"))
-            self.write(int(time.time() - t0))
+        t0 = self.busy_since = time.time()
+        try:
+            with self.lock:
+                if level == "full" or not self.chans:
+                    self.full()
+                else:
+                    self.recheck(main_only=(level == "main"))
+                self.write(int(time.time() - t0))
+        finally:
+            self.busy_since = 0
 
 
 def status_html(s):
@@ -488,7 +502,11 @@ def serve(cfg):
         def log_message(self, *a):
             pass
 
-    srv = ThreadingHTTPServer((cfg.get("listen", "0.0.0.0"), cfg.get("port", 8090)), H)
+    try:
+        srv = ThreadingHTTPServer((cfg.get("listen", "0.0.0.0"), cfg.get("port", 8090)), H)
+    except OSError as ex:
+        log(f"порт {cfg.get('port', 8090)} занят ({ex}) — выход")
+        os._exit(2)
     log(f"HTTP на :{srv.server_port}")
     srv.serve_forever()
 
@@ -562,6 +580,18 @@ def main():
         agg.step("full")
         return
     threading.Thread(target=serve, args=(cfg,), daemon=True).start()
+
+    def watchdog():
+        """Проверка висит дольше step_max_min (сеть «залипла», поток не отдаёт таймаут) — выходим,
+        run.sh перезапустит. Плеер тем временем играет по своей копии списка."""
+        limit = cfg.get("step_max_min", 30) * 60
+        while True:
+            time.sleep(60)
+            if agg.busy_since and time.time() - agg.busy_since > limit:
+                log(f"проверка висит дольше {limit // 60} мин — перезапуск")
+                os._exit(3)
+
+    threading.Thread(target=watchdog, daemon=True).start()
     every = {"full": cfg.get("full_every_min", 720), "all": cfg.get("all_every_min", 120), "main": cfg.get("main_every_min", 30)}
     due = {lvl: 0 for lvl in every}
     flag = cfg.get("restart_flag")

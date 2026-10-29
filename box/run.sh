@@ -2,6 +2,9 @@
 # Держит сборщик запущенным и применяет обновления, которые agg.py скачал и проверил в next/.
 # Если новая версия трижды подряд падает в первые 2 минуты — откат на prev/ и версия помечается плохой.
 cd ~/iptv-agg || exit 1
+# вторую копию не запускаем (плеер может позвать нас, когда сборщик и так жив)
+if [ -f run.pid ] && [ "$(cat run.pid)" != "$$" ] && kill -0 "$(cat run.pid)" 2>/dev/null; then exit 0; fi
+echo $$ > run.pid
 fails=0
 while true; do
     if [ -f next/version ]; then
@@ -17,7 +20,10 @@ while true; do
     [ -f agg.log ] && [ $(wc -c < agg.log) -gt 1000000 ] && tail -c 200000 agg.log > agg.log.1 && mv agg.log.1 agg.log
     start=$(date +%s)
     python agg.py config.json >> agg.log 2>&1
-    if [ $(( $(date +%s) - start )) -lt 120 ]; then fails=$((fails + 1)); else fails=0; fi
+    rc=$?
+    # 2 = порт занят, 3 = сторож поймал зависание: это не «новая версия падает», откат не нужен
+    if [ $rc -eq 2 ] || [ $rc -eq 3 ]; then fails=0
+    elif [ $(( $(date +%s) - start )) -lt 120 ]; then fails=$((fails + 1)); else fails=0; fi
     if [ $fails -ge 3 ] && [ -d prev ]; then
         cp version bad_version 2>/dev/null
         for f in prev/*; do cp "$f" "$f.tmp" && mv "$f.tmp" "./$(basename $f)"; done

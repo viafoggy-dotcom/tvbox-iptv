@@ -28,6 +28,9 @@ termux-wake-lock
 exec sh ~/iptv-agg/run.sh >/dev/null 2>&1
 EOF
 chmod +x ~/.termux/boot/iptv-agg
+# плеер «ТВ» может сам поднять сборщик через RUN_COMMAND, если тот не отвечает
+mkdir -p ~/.termux
+grep -q '^allow-external-apps' ~/.termux/termux.properties 2>/dev/null || echo 'allow-external-apps = true' >> ~/.termux/termux.properties
 pkill -f iptv-agg/run.sh; pkill -f "agg.py config.json"
 nohup sh ~/.termux/boot/iptv-agg >/dev/null 2>&1 &
 echo "SETUP OK"
