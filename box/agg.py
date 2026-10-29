@@ -328,7 +328,10 @@ def kz_resolve(page):
         text = kz_page(url, ref)
         m = KZ_M3U8.search(text)
         if m:
-            return m.group(0).replace("\\/", "/"), url
+            link = html.unescape(m.group(0).replace("\\/", "/"))
+            # плееры cdntvtech: playersjs.php?file=<закодированная ссылка на livetv.php?key=….m3u8>
+            inner = parse_qs(urlsplit(link).query).get("file", [""])[0]
+            return (inner if ".m3u8" in inner else link), url
         frames = [urljoin(url, html.unescape(s)) for s in KZ_IFRAME.findall(text)]
         frames = [f for f in frames if not re.search(r"google|yandex|adfinity", f)]
         if not frames:
@@ -382,7 +385,7 @@ def kz_rewrite(text, base_url, ref, local, slug):
     чтобы при обновлении плейлиста подпись бралась свежая, а не та, что была при старте."""
     def wrap(u):
         return f"{local}/kz/r?u={quote(urljoin(base_url, u), safe='')}&ref={quote(ref, safe='')}"
-    master = "#EXT-X-STREAM-INF" in text
+    master = bool(slug) and "#EXT-X-STREAM-INF" in text
     out, var = [], 0
     for line in text.splitlines():
         if line.startswith("#"):
@@ -430,14 +433,16 @@ def kz_handle(h):
             ref = q.get("ref", [""])[0]
             with kz_open(q["u"][0], ref, timeout=20) as r:
                 ctype = r.headers.get("Content-Type", "")
-                if "mpegurl" in ctype.lower() or r.geturl().split("?")[0].endswith(".m3u8"):
-                    text = r.read().decode("utf-8", "replace")
+                head = r.read(7)   # livetv.php отдаёт плейлисты без mpegurl и без .m3u8 в пути
+                if head == b"#EXTM3U" or "mpegurl" in ctype.lower():
+                    text = (head + r.read()).decode("utf-8", "replace")
                     return send(kz_rewrite(text, r.geturl(), ref, local, "").encode(), "application/vnd.apple.mpegurl")
                 h.send_response(200)
                 h.send_header("Content-Type", ctype or "video/mp2t")
                 if r.headers.get("Content-Length"):
                     h.send_header("Content-Length", r.headers["Content-Length"])
                 h.end_headers()
+                h.wfile.write(head)
                 shutil.copyfileobj(r, h.wfile, 65536)
                 return
         send(b"not found\n", "text/plain", 404)
@@ -794,6 +799,7 @@ def selftest(cfg):
     assert kz_expiry("https://x/sig/2051/1793298074/index.m3u8") == 1793298074
     pl = kz_rewrite("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi/index.m3u8\n", "https://c/2051/index.m3u8", "https://p/x", "http://l", "s")
     assert "http://l/kz/s.m3u8?v=0" in pl
+    assert "/kz/r?u=" in kz_rewrite("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi.m3u8\n", "https://c/", "https://p/x", "http://l", "")
     assert cfg["sources"] and cfg["out_dir"]
     Agg(dict(cfg, state="/nonexistent/state.json"))
     print("selftest ok")
