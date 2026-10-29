@@ -355,12 +355,13 @@ class KzLinks:
     def __init__(self):
         self.lock = threading.Lock()
         self.pages, self.links = {}, {}
+        self.index = None   # адрес kinozals.html: страница канала рядом с ним, пока список не загружен
 
     def get(self, slug):
         now = time.time()
         with self.lock:
             hit = self.links.get(slug)
-            page = self.pages.get(slug)
+            page = self.pages.get(slug) or (self.index and urljoin(self.index, slug + ".html"))
         if hit and hit[2] > now:
             return hit[0], hit[1]
         if not page:
@@ -438,7 +439,8 @@ def kz_handle(h):
                     text = (head + r.read()).decode("utf-8", "replace")
                     return send(kz_rewrite(text, r.geturl(), ref, local, "").encode(), "application/vnd.apple.mpegurl")
                 h.send_response(200)
-                h.send_header("Content-Type", ctype or "video/mp2t")
+                # tvcdnpotok отдаёт сегменты как text/plain — часть плееров тогда не показывает картинку
+                h.send_header("Content-Type", "video/mp2t" if not ctype or ctype.startswith("text/") else ctype)
                 if r.headers.get("Content-Length"):
                     h.send_header("Content-Length", r.headers["Content-Length"])
                 h.end_headers()
@@ -716,6 +718,7 @@ tr.bad{{color:#b00}}tr:nth-child(even){{background:#f3f3f3}}</style>
 
 def serve(cfg):
     out = os.path.abspath(cfg["out_dir"])
+    KZ.index = cfg.get("kinozals")
 
     class H(SimpleHTTPRequestHandler):
         def __init__(self, *a, **k):
