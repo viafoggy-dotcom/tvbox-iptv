@@ -326,9 +326,9 @@ def kz_resolve(page):
     url, ref = page, None
     for _ in range(5):
         text = kz_page(url, ref)
-        m = KZ_M3U8.search(text)
+        m = KZ_M3U8.search(html.unescape(text))   # ok.ru: JSON с hlsMasterPlaylistUrl в атрибуте через &quot;
         if m:
-            link = html.unescape(m.group(0).replace("\\/", "/"))
+            link = m.group(0).replace("\\/", "/").rstrip("\\")
             # плееры cdntvtech: playersjs.php?file=<закодированная ссылка на livetv.php?key=….m3u8>
             inner = parse_qs(urlsplit(link).query).get("file", [""])[0]
             return (inner if ".m3u8" in inner else link), url
@@ -423,6 +423,16 @@ def kz_handle(h):
         send(kz_rewrite(text, url, ref, local, slug).encode(), "application/vnd.apple.mpegurl")
 
     try:
+        m = re.fullmatch(r"/kz/([\w-]+)\.json", path)   # отладка: какую ссылку добыли и откуда
+        if m:
+            KZ.drop(m[1])
+            link, ref = KZ.get(m[1])
+            try:
+                with kz_open(link, ref) as r:
+                    st = f"{r.status} {r.headers.get('Content-Type', '')}"
+            except urllib.error.HTTPError as ex:
+                st = f"{ex.code} {ex.read(300).decode('utf-8', 'replace')}"
+            return send(json.dumps({"m3u8": link, "referer": ref, "stream": st}, ensure_ascii=False).encode(), "application/json")
         m = re.fullmatch(r"/kz/([\w-]+)\.m3u8", path)
         if m:
             try:
