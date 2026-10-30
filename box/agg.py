@@ -373,6 +373,36 @@ def wrap_master(url, ua=None):
     return master
 
 
+# ---------- логотипы: копии на NAS ----------
+# Логотипы в источниках — в основном iptvx.one и imgur, а их домашний провайдер режет. Копии лежат в
+# out/logos/<sha1(адрес)[:16]>.png (часть залита с Mac через VPN); недостающие докачиваем сами, если сайт отвечает.
+
+def logo_name(url):
+    return hashlib.sha1(url.encode()).hexdigest()[:16] + ".png"
+
+
+def logo_fetch(out, urls):
+    def run():
+        d = os.path.join(out, "logos")
+        os.makedirs(d, exist_ok=True)
+        got = 0
+        for u in urls:
+            p = os.path.join(d, logo_name(u))
+            if os.path.exists(p) or os.path.exists(p + ".bad"):
+                continue
+            try:
+                data = fetch(u, timeout=8)[0]
+                if len(data) < 100:
+                    raise ValueError("пусто")
+                open(p, "wb").write(data)
+                got += 1
+            except Exception:
+                open(p + ".bad", "w").close()   # недоступен — не пробуем каждый раз
+        if got:
+            log(f"логотипы: докачано {got}")
+    threading.Thread(target=run, daemon=True).start()
+
+
 def sm_local(url, local):
     m = SM_URL.match(url)
     return f"{local}/sm/{m[1]}/{m[2]}.m3u8" if m else None
@@ -761,7 +791,7 @@ class Agg:
                     c["main"][0] if c["main"] else 10 ** 6, c["name"].lower())
 
         report, main_lines, all_lines, player = [], [], [], []
-        sm_keys = set()
+        sm_keys, logos = set(), set()
         for c in sorted(units, key=key):
             url = self.chosen.get(c["key"])
             best = next((e for e in c["cand"] if e["url"] == url), None)
@@ -809,12 +839,17 @@ class Agg:
                 streams.append({"url": u, "ua": e["ua"] or "", "ref": e["ref"] or "", "hls": hls})
             if surl:
                 streams.append({"url": surl, "ua": "", "ref": "", "hls": True})
+            logo = c["tvg"].get("logo", "") or (sc or {}).get("logo", "")
+            if logo:
+                logos.add(logo)
+                if os.path.exists(os.path.join(out, "logos", logo_name(logo))):
+                    logo = f"{local}/logos/{logo_name(logo)}"
             player.append({"n": len(player) + 1, "name": c["name"], "group": c["group"], "main": bool(c["main"]),
-                           "tvg": c["tvg"].get("id", ""), "logo": c["tvg"].get("logo", "") or (sc or {}).get("logo", ""),
-                           "streams": streams})
+                           "tvg": c["tvg"].get("id", ""), "logo": logo, "streams": streams})
             if c["main"]:
                 main_lines += lines
         sm_prewarm(sorted(sm_keys))
+        logo_fetch(out, sorted(logos))
         for fn, ls in (("main.m3u", main_lines), ("playlist.m3u", all_lines)):
             tmp = os.path.join(out, fn + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
