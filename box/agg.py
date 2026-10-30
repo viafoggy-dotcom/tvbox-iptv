@@ -342,6 +342,9 @@ def sm_prewarm(keys):
 # (относительные ссылки → абсолютные) или собранный из одного варианта. Сегменты плеер по-прежнему берёт напрямую.
 
 W_CACHE = {}   # адрес → (текст, срок)
+# CDN, где ссылки из плейлиста привязаны к запросившему (mirtv: ?hls_proxy_host=…) — плейлист с NAS, а видео
+# напрямую не сходятся. Такие потоки целиком идут через NAS (/kz/r, как потоки сайта): ~6 Мбит/с на канал.
+RELAY_HOSTS = re.compile(r"(^|\.)hls-?mirtv\.cdnvideo\.ru$")
 
 
 def wrap_master(url, ua=None):
@@ -799,7 +802,9 @@ class Agg:
                     sm_keys.add(SM_URL.match(e["url"]).groups())
                 hls = bool(self.last[e["url"]].get("hls"))
                 u = e["url"]
-                if hls and not e["ref"]:   # первый плейлист — с NAS: так AVPlay не виснет на подготовке
+                if hls and RELAY_HOSTS.search(urlsplit(u).hostname or ""):
+                    u = f"{local}/kz/r?u={quote(u, safe='')}&ref={quote(kz_origin(u) + '/', safe='')}"
+                elif hls and not e["ref"]:   # первый плейлист — с NAS: так AVPlay не виснет на подготовке
                     u = f"{local}/w?u={quote(u, safe='')}" + (f"&ua={quote(e['ua'], safe='')}" if e["ua"] else "")
                 streams.append({"url": u, "ua": e["ua"] or "", "ref": e["ref"] or "", "hls": hls})
             if surl:
