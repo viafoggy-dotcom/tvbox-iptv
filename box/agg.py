@@ -591,6 +591,9 @@ def kz_handle(h):
 
     def playlist(slug, v):
         link, ref = KZ.get(slug)
+        sm = SM_URL.match(link)
+        if sm:   # плеер сайта ведёт на один вариант smotrim, а они пропадают (у «Соловьёв.Live» исчез _6) — отдаём master
+            return send(sm_master(*sm.groups()).encode(), "application/vnd.apple.mpegurl")
         with kz_open(link, ref) as r:
             url, text = r.geturl(), r.read().decode("utf-8", "replace")
         if v is not None and "#EXT-X-STREAM-INF" in text:
@@ -763,6 +766,8 @@ class Agg:
         def check(c):
             try:
                 link, ref = KZ.get(c["slug"])
+                if SM_URL.match(link):
+                    return "#EXT-X-STREAM-INF" in sm_master(*SM_URL.match(link).groups())
                 with kz_open(link, ref) as r:
                     return b"#EXTM3U" in r.read(4096)
             except Exception:
