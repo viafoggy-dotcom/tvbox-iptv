@@ -1059,6 +1059,18 @@ def serve(cfg):
         def do_GET(self):
             if self.path.startswith("/kz/"):
                 return kz_handle(self)
+            if self.path == "/log":   # хвост журнала — плеер прикладывает его к «Отправить журнал»
+                try:
+                    with open("agg.log", "rb") as f:
+                        f.seek(max(0, os.path.getsize("agg.log") - 600_000))
+                        body = f.read()
+                except OSError:
+                    body = b""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return self.wfile.write(body)
             if self.path.startswith("/w?"):
                 q = parse_qs(urlsplit(self.path).query)
                 try:
