@@ -223,6 +223,36 @@ def group_channels(entries, main_only=False):
 
 # ---------- проверка потока ----------
 
+TS_VIDEO = {0x1b: "h264", 0x24: "hevc", 0x02: "mpeg2", 0x01: "mpeg2"}
+
+
+def ts_video_codec(data):
+    """Кодек видео по PMT сегмента MPEG-TS. MPEG-2 телевизор Samsung в HLS не показывает (только звук)."""
+    pmt = set()
+    for i in range(0, len(data) - 187, 188):
+        p = data[i:i + 188]
+        if p[0] != 0x47 or not p[1] & 0x40:
+            continue
+        pid = ((p[1] & 0x1f) << 8) | p[2]
+        off = 4 + (1 + p[4] if (p[3] >> 4) & 2 else 0)
+        pl = p[off:]
+        if not pl:
+            continue
+        pl = pl[1 + pl[0]:]
+        if pid == 0 and pl[:1] == b"\x00":
+            n = ((pl[1] & 0x0f) << 8) | pl[2]
+            pmt.update(((pl[j + 2] & 0x1f) << 8) | pl[j + 3] for j in range(8, min(3 + n - 4, len(pl) - 3), 4))
+        elif pid in pmt and pl[:1] == b"\x02":
+            n = ((pl[1] & 0x0f) << 8) | pl[2]
+            j = 12 + (((pl[10] & 0x0f) << 8) | pl[11])
+            while j < min(3 + n - 4, len(pl) - 4):
+                if pl[j] in TS_VIDEO:
+                    return TS_VIDEO[pl[j]]
+                j += 5 + (((pl[j + 3] & 0x0f) << 8) | pl[j + 4])
+            return ""
+    return ""
+
+
 def probe(e, seg_bytes=SEG_SMALL):
     """master → лучший вариант ≤1080p → сегмент. Возвращает ok, height, need/got (кбит/с), ms, err."""
     ua, ref = e["ua"] or DEFAULT_UA, e["ref"]
@@ -268,6 +298,7 @@ def probe(e, seg_bytes=SEG_SMALL):
                 break
             if seg_bytes >= SEG_SPEED:
                 res["got"] = int(len(data) * 8 / dt / 1000)
+            res["vcodec"] = ts_video_codec(data)
             res["ok"] = True
             break
     except Exception as ex:
@@ -665,6 +696,7 @@ class Agg:
             1,
             round(self.rate(e["url"]), 1),            # стабильность за последние проверки
             0 if slow else 1,                         # успевает ли сервер отдавать поток
+            0 if r.get("vcodec") == "mpeg2" else 1,   # MPEG-2: на Samsung только звук, на приставках — как повезёт
             0 if r["ms"] > START_SLOW_MS else 1,      # быстро ли стартует: переключение каналов важнее разрешения
             0 if is_regional(e["name"]) else 1,
             min(r["height"] or (1080 if re.search(r"\b(hd|fhd)\b", e["name"], re.I) else 576), 1080),
@@ -836,7 +868,8 @@ class Agg:
                     u = f"{local}/kz/r?u={quote(u, safe='')}&ref={quote(kz_origin(u) + '/', safe='')}"
                 elif hls and not e["ref"]:   # первый плейлист — с NAS: так AVPlay не виснет на подготовке
                     u = f"{local}/w?u={quote(u, safe='')}" + (f"&ua={quote(e['ua'], safe='')}" if e["ua"] else "")
-                streams.append({"url": u, "ua": e["ua"] or "", "ref": e["ref"] or "", "hls": hls})
+                streams.append({"url": u, "ua": e["ua"] or "", "ref": e["ref"] or "", "hls": hls,
+                                "v": self.last[e["url"]].get("vcodec", "")})
             if surl:
                 streams.append({"url": surl, "ua": "", "ref": "", "hls": True})
             logo = c["tvg"].get("logo", "") or (sc or {}).get("logo", "")
@@ -1186,6 +1219,10 @@ def selftest(cfg):
            '<programme start="20261022120000 +0300" stop="20261022130000 +0300" channel="7">\n<title lang="ru">Вести</title>\n</programme>\n').encode()
     assert parse_epg(xml.splitlines(True), one, 0, 2e9) == {"Первый канал": [[1792659600, 1792663200, "Новости"]],
                                                            "Россия 1": [[1792659600, 1792663200, "Вести"]]}
+    seg = bytes([0x47, 0x40, 0x00, 0x10, 0x00, 0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00]) + bytes(171)
+    seg += bytes([0x47, 0x41, 0x00, 0x10, 0x00, 0x02, 0xb0, 0x12, 0x00, 0x01, 0xc1, 0x00, 0x00, 0xe1, 0x01, 0xf0, 0x00,
+                  0x02, 0xe1, 0x01, 0xf0, 0x00]) + bytes(166)
+    assert ts_video_codec(seg) == "mpeg2", ts_video_codec(seg)
     assert sm_local("https://stream.smotrim.ru/hls2/russia_hd/playlist_6.m3u8", "http://l") == "http://l/sm/hls2/russia_hd.m3u8"
     assert cfg["sources"] and cfg["out_dir"]
     Agg(dict(cfg, state="/nonexistent/state.json"))
