@@ -11,7 +11,8 @@
 
 Отдаёт: /playlist.m3u (основные, затем все остальные), /main.m3u, /channels.json и /epg.json (свой плеер),
 /status, /status.json.
-Кинозалы smotret-online.tv (ключ kinozals в config) — группой в конце playlist.m3u, потоки через /kz/.
+Каналы smotret-online.tv (site_sections в config): разделы сайта = группы плейлиста, совпавшие каналы получают
+поток сайта запасным, остальные добавляются; потоки сайта — через /kz/ со свежей подписью.
 """
 import calendar
 import concurrent.futures as cf
@@ -279,11 +280,22 @@ def probe(e, seg_bytes=SEG_SMALL):
 # /kz/<slug>.m3u8 добывает свежую ссылку (страница → iframe плеера → m3u8) и проксирует поток
 # с заголовками браузера: без них плеер cdntvmedia отвечает 403 (как и на IP датацентров).
 
-KZ_GROUP = "Кинозалы"
+# разделы сайта задают группы всего плейлиста; наши группы без канала на сайте — в ближайший раздел
+SITE_GROUP = {"Эфирные": "Общественные", "Популярные": "Развлекательные", "Новости": "Новостные",
+              "Спорт": "Спортивные", "Музыка": "Музыкальные", "Кино и сериалы": "Фильмы и сериалы",
+              "Детские": "Детские", "Познавательные": "Познавательные", "Развлекательные": "Развлекательные",
+              "Региональные": "Региональные"}
+REGION_GROUP, OTHER_GROUP = "Региональные", "Другие"
 KZ_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
          "(KHTML, like Gecko) Version/18.6 Safari/605.1.15")
 KZ_IFRAME = re.compile(r'<iframe[^>]+src=["\']([^"\']+)["\']', re.I)
 KZ_M3U8 = re.compile(r'https?:(?:\\?/){2}[^"\'\s<>]+?\.m3u8[^"\'\s<>]*', re.I)
+
+
+def site_key(name):
+    """Ключ канала сайта — как в group_channels: каноническое имя каталога или norm()."""
+    main = ALIAS.get(norm(name))
+    return main[2] if main else norm(name)
 
 
 def kz_origin(url):
@@ -357,7 +369,7 @@ class KzLinks:
     def __init__(self):
         self.lock = threading.Lock()
         self.pages, self.links = {}, {}
-        self.index = None   # адрес kinozals.html: страница канала рядом с ним, пока список не загружен
+        self.index = None   # адрес раздела сайта: страница канала рядом с ним, пока список не загружен
 
     def get(self, slug):
         now = time.time()
@@ -484,7 +496,7 @@ class Agg:
         self.last = d.get("last", {})        # url → результат последней проверки
         self.chosen = d.get("chosen", {})    # канал → url
         self.chans = {}
-        self.kz = []                         # кинозалы: [{"slug", "name", "logo", "page", "ok"}]
+        self.kz = []                         # каналы сайта: [{"slug", "name", "logo", "page", "group", "ok"}]
         self.lock = threading.Lock()
         self.busy_since = 0
 
@@ -563,16 +575,22 @@ class Agg:
         self.kz_refresh()
 
     def kz_refresh(self):
-        """Список кинозалов со страницы и проверка, что у каждого добывается живой плейлист."""
-        index = self.cfg.get("kinozals")
-        if not index:
+        """Каналы всех разделов сайта (раздел = группа) и проверка, что у каждого добывается живой плейлист."""
+        sections = self.cfg.get("site_sections", [])
+        if not sections:
             self.kz = []
             return
-        try:
-            kz = kz_channels(index)
-        except Exception as ex:
-            log(f"кинозалы: список недоступен ({ex!r}), оставляю прошлый")
-            return
+        kz, seen = [], set()
+        for url, grp in sections:
+            try:
+                got = kz_channels(url)
+            except Exception as ex:
+                log(f"сайт: раздел {grp} недоступен ({ex!r}), оставляю прошлый")
+                got = [dict(c) for c in self.kz if c["group"] == grp]
+            for c in got:
+                if c["slug"] not in seen:       # канал в двух разделах — в первом
+                    seen.add(c["slug"])
+                    kz.append(dict(c, group=grp))
         with KZ.lock:
             KZ.pages = {c["slug"]: c["page"] for c in kz}
 
@@ -588,7 +606,7 @@ class Agg:
             for c, ok in zip(kz, ex.map(check, kz)):
                 c["ok"] = ok
         self.kz = kz
-        log(f"кинозалы: живых {sum(c['ok'] for c in kz)} из {len(kz)}")
+        log(f"сайт: живых {sum(c['ok'] for c in kz)} из {len(kz)}")
 
     def recheck(self, main_only):
         """Перечитать источники (ссылки с токенами меняются), проверить новые ссылки и текущие потоки;
@@ -612,60 +630,72 @@ class Agg:
         cfg, out = self.cfg, self.cfg["out_dir"]
         os.makedirs(out, exist_ok=True)
         hdr = f'#EXTM3U url-tvg="{cfg["epg"]}" x-tvg-url="{cfg["epg"]}"'
-        gorder = {g: i for i, g in enumerate(MAIN_GROUPS)}
+        local = cfg.get("kz_base") or f"http://127.0.0.1:{cfg.get('port', 8090)}"
+        # каналы сайта: совпавшие с нашими дают им раздел сайта и запасной поток через /kz/, остальные — новыми каналами
+        site, spos = {}, {}
+        for i, sc in enumerate(self.kz):
+            k = site_key(sc["name"])
+            if k not in site:
+                site[k], spos[k] = sc, i
+        any_ok = any(sc["ok"] for sc in self.kz)   # не прошёл ни один — сайт лёг на время проверки, адреса-то наши
+        sections = [g for _, g in cfg.get("site_sections", [])]
 
-        def key(c):   # группы основных — первыми; внутри группы сначала основные по каталогу, затем по алфавиту
-            return (gorder.get(c["group"], 99), c["group"], 0 if c["main"] else 1, c["main"][0] if c["main"] else 0, c["name"].lower())
+        def group(c):
+            sc = site.get(c["key"])
+            if sc:
+                return sc["group"]
+            return SITE_GROUP.get(c["group"], OTHER_GROUP) if sections else c["group"]
+
+        order = sections + [REGION_GROUP, OTHER_GROUP] if sections else MAIN_GROUPS
+        gorder = {g: i for i, g in enumerate(order)}
+        units = [dict(c, group=group(c)) for c in self.chans.values()]
+        units += [{"key": k, "name": sc["name"], "group": sc["group"], "main": None, "cand": [], "tvg": {"logo": sc["logo"]}}
+                  for k, sc in site.items() if k not in self.chans]
+
+        def key(c):   # раздел; внутри — порядок сайта, затем основные по каталогу, затем по алфавиту
+            return (gorder.get(c["group"], 99), c["group"], spos.get(c["key"], 10 ** 6),
+                    c["main"][0] if c["main"] else 10 ** 6, c["name"].lower())
 
         report, main_lines, all_lines, player = [], [], [], []
-        for c in sorted(self.chans.values(), key=key):
+        for c in sorted(units, key=key):
             url = self.chosen.get(c["key"])
             best = next((e for e in c["cand"] if e["url"] == url), None)
             r = self.last.get(url, {}) if best else {}
             ok = bool(r.get("ok"))
+            sc = site.get(c["key"])
+            surl = f"{local}/kz/{sc['slug']}.m3u8" if sc and (sc["ok"] or not any_ok) else None
             report.append({
-                "channel": c["name"], "group": c["group"], "main": bool(c["main"]), "ok": ok,
-                "alive": sum(1 for e in c["cand"] if self.last.get(e["url"], {}).get("ok")), "total": len(c["cand"]),
-                "url": url if ok else None, "src": best["src"] if ok else None,
+                "channel": c["name"], "group": c["group"], "main": bool(c["main"]), "ok": ok or bool(surl),
+                "alive": sum(1 for e in c["cand"] if self.last.get(e["url"], {}).get("ok")) + bool(surl),
+                "total": len(c["cand"]) + bool(sc),
+                "url": url if ok else surl, "src": best["src"] if ok else ("smotret-online" if surl else None),
                 "height": r.get("height", 0), "need": r.get("need", 0), "got": r.get("got", 0), "ms": r.get("ms", 0),
-                "rate": self.rate(url) if ok else 0,
+                "rate": self.rate(url) if ok else (1 if surl else 0),
                 "errors": sorted({self.last.get(e["url"], {}).get("err", "") for e in c["cand"]} - {""}),
             })
-            if not ok:
+            if not ok and not surl:
                 continue
-            attrs = (f'tvg-id="{c["tvg"].get("id", "")}" tvg-name="{c["name"]}" tvg-logo="{c["tvg"].get("logo", "")}" '
+            attrs = (f'tvg-id="{c["tvg"].get("id", "")}" tvg-name="{c["name"]}" tvg-logo="{c["tvg"].get("logo", "") or (sc or {}).get("logo", "")}" '
                      f'group-title="{c["group"]}"')
             lines = [f"#EXTINF:-1 {attrs},{c['name']}"]
-            if best["ua"]:
+            if ok and best["ua"]:
                 lines.append(f"#EXTVLCOPT:http-user-agent={best['ua']}")
-            if best["ref"]:
+            if ok and best["ref"]:
                 lines.append(f"#EXTVLCOPT:http-referrer={best['ref']}")
-            lines.append(url)
+            lines.append(url if ok else surl)
             all_lines += lines
-            # для своего плеера: выбранный поток первым, затем живые запасные по убыванию качества
+            # для своего плеера: выбранный поток первым, затем живые запасные по убыванию качества, сайт — последним
             alive = sorted((e for e in c["cand"] if self.last.get(e["url"], {}).get("ok")),
                            key=lambda e: (e["url"] == url, self.score(e, url)), reverse=True)[:cfg.get("player_streams", 10)]
+            streams = [{"url": e["url"], "ua": e["ua"] or "", "ref": e["ref"] or "",
+                        "hls": bool(self.last[e["url"]].get("hls"))} for e in alive]
+            if surl:
+                streams.append({"url": surl, "ua": "", "ref": "", "hls": True})
             player.append({"n": len(player) + 1, "name": c["name"], "group": c["group"], "main": bool(c["main"]),
-                           "tvg": c["tvg"].get("id", ""), "logo": c["tvg"].get("logo", ""),
-                           "streams": [{"url": e["url"], "ua": e["ua"] or "", "ref": e["ref"] or "",
-                                        "hls": bool(self.last[e["url"]].get("hls"))} for e in alive]})
+                           "tvg": c["tvg"].get("id", ""), "logo": c["tvg"].get("logo", "") or (sc or {}).get("logo", ""),
+                           "streams": streams})
             if c["main"]:
                 main_lines += lines
-        # кинозалы: если не прошёл ни один (сайт лёг на время проверки) — оставляем все, адреса-то наши
-        local = cfg.get("kz_base") or f"http://127.0.0.1:{cfg.get('port', 8090)}"
-        any_ok = any(c["ok"] for c in self.kz)
-        for c in self.kz:
-            url = f"{local}/kz/{c['slug']}.m3u8"
-            report.append({"channel": c["name"], "group": KZ_GROUP, "main": False, "ok": bool(c["ok"]),
-                           "alive": int(bool(c["ok"])), "total": 1, "url": url, "src": "smotret-online",
-                           "height": 0, "need": 0, "got": 0, "ms": 0, "rate": 1 if c["ok"] else 0,
-                           "errors": [] if c["ok"] else ["ссылка не добыта"]})
-            if any_ok and not c["ok"]:
-                continue
-            all_lines += [f'#EXTINF:-1 tvg-id="{c["slug"]}" tvg-name="{c["name"]}" tvg-logo="{c["logo"]}" '
-                          f'group-title="{KZ_GROUP}",{c["name"]}', url]
-            player.append({"n": len(player) + 1, "name": c["name"], "group": KZ_GROUP, "main": False,
-                           "tvg": c["slug"], "logo": c["logo"], "streams": [{"url": url, "ua": "", "ref": "", "hls": True}]})
         for fn, ls in (("main.m3u", main_lines), ("playlist.m3u", all_lines)):
             tmp = os.path.join(out, fn + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
@@ -866,7 +896,7 @@ def epg_loop(cfg):
 
 def serve(cfg):
     out = os.path.abspath(cfg["out_dir"])
-    KZ.index = cfg.get("kinozals")
+    KZ.index = (cfg.get("site_sections") or [[None]])[0][0]
 
     class H(SimpleHTTPRequestHandler):
         def __init__(self, *a, **k):

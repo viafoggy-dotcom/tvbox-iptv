@@ -36,5 +36,42 @@
   "player_streams": 10,
   "step_max_min": 30,
   "log_copy": "/sdcard/iptv-agg/agg.log",
-  "kinozals": "https://smotret-online.tv/kinozals.html"
+  "site_sections": [
+    [
+      "https://smotret-online.tv/obshchestvennye-telekanaly.html",
+      "Общественные"
+    ],
+    [
+      "https://smotret-online.tv/novostnye-telekanaly.html",
+      "Новостные"
+    ],
+    [
+      "https://smotret-online.tv/sportivnye-telekanaly.html",
+      "Спортивные"
+    ],
+    [
+      "https://smotret-online.tv/razvlekatelnye-telekanaly.html",
+      "Развлекательные"
+    ],
+    [
+      "https://smotret-online.tv/poznavatelnie-telekanaly.html",
+      "Познавательные"
+    ],
+    [
+      "https://smotret-online.tv/muzykalnye-telekanaly.html",
+      "Музыкальные"
+    ],
+    [
+      "https://smotret-online.tv/filmy-i-serialy.html",
+      "Фильмы и сериалы"
+    ],
+    [
+      "https://smotret-online.tv/detskie-telekanaly.html",
+      "Детские"
+    ],
+    [
+      "https://smotret-online.tv/kinozals.html",
+      "Кинозалы"
+    ]
+  ]
 }
