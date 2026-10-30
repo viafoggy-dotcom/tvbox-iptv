@@ -336,6 +336,40 @@ def sm_prewarm(keys):
     threading.Thread(target=run, daemon=True).start()
 
 
+# ---------- обёртка /w: первый плейлист — с NAS ----------
+# Плеер Samsung (AVPlay) часто зависает на подготовке, если первый запрос идёт на внешний сервер (A/B на ТВ:
+# напрямую ~половина запусков висит >20 с, плейлист с NAS — 4 из 4). /w?u=<адрес> отдаёт master: исходный
+# (относительные ссылки → абсолютные) или собранный из одного варианта. Сегменты плеер по-прежнему берёт напрямую.
+
+W_CACHE = {}   # адрес → (текст, срок)
+
+
+def wrap_master(url, ua=None):
+    hit = W_CACHE.get(url)
+    if hit and hit[1] > time.time():
+        return hit[0]
+    body, final, _ = fetch(url, ua or DEFAULT_UA, 262144, 8)
+    text = body.decode("utf-8", "replace")
+    if "#EXTM3U" not in text:
+        raise LookupError("не плейлист")
+    if "#EXT-X-STREAM-INF" in text:
+        out = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                line = urljoin(final, line)
+            elif 'URI="' in line:
+                line = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{urljoin(final, m.group(1))}"', line)
+            out.append(line)
+        master = "\n".join(out) + "\n"
+    else:
+        master = f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\n{final}\n"
+    W_CACHE[url] = (master, time.time() + 30)   # у dmi3y хост варианта меняется — держим недолго
+    if len(W_CACHE) > 500:
+        W_CACHE.clear()
+    return master
+
+
 def sm_local(url, local):
     m = SM_URL.match(url)
     return f"{local}/sm/{m[1]}/{m[2]}.m3u8" if m else None
@@ -761,8 +795,11 @@ class Agg:
                 if sm:   # сначала master со всеми качествами (старт с лёгкого), исходный вариант — запасным
                     streams.append({"url": sm, "ua": "", "ref": "", "hls": True})
                     sm_keys.add(SM_URL.match(e["url"]).groups())
-                streams.append({"url": e["url"], "ua": e["ua"] or "", "ref": e["ref"] or "",
-                                "hls": bool(self.last[e["url"]].get("hls"))})
+                hls = bool(self.last[e["url"]].get("hls"))
+                u = e["url"]
+                if hls and not e["ref"]:   # первый плейлист — с NAS: так AVPlay не виснет на подготовке
+                    u = f"{local}/w?u={quote(u, safe='')}" + (f"&ua={quote(e['ua'], safe='')}" if e["ua"] else "")
+                streams.append({"url": u, "ua": e["ua"] or "", "ref": e["ref"] or "", "hls": hls})
             if surl:
                 streams.append({"url": surl, "ua": "", "ref": "", "hls": True})
             player.append({"n": len(player) + 1, "name": c["name"], "group": c["group"], "main": bool(c["main"]),
@@ -980,6 +1017,24 @@ def serve(cfg):
         def do_GET(self):
             if self.path.startswith("/kz/"):
                 return kz_handle(self)
+            if self.path.startswith("/w?"):
+                q = parse_qs(urlsplit(self.path).query)
+                try:
+                    body = wrap_master(q["u"][0], q.get("ua", [None])[0]).encode()
+                except Exception as ex:
+                    log(f"обёртка {q.get('u', ['?'])[0][:80]}: {ex!r}")
+                    return self.send_error(502)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return self.wfile.write(body)
+            if self.path.startswith("/zap?"):   # замеры переключения от плеера телевизора — в журнал
+                q = parse_qs(urlsplit(self.path).query)
+                log("zap " + " ".join(f"{k}={v[0][:300 if k == 'steps' else 90]}" for k, v in q.items()))
+                self.send_response(204)
+                self.end_headers()
+                return
             m = re.fullmatch(r"/sm/(hls2?)/([\w-]+)\.m3u8", self.path)
             if m:
                 try:
