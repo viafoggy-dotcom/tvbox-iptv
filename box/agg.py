@@ -37,6 +37,7 @@ DEFAULT_UA = "Mozilla/5.0 (Linux; Android 10; TV) AppleWebKit/537.36 (KHTML, lik
 HISTORY = 12          # сколько последних проверок помнить на поток
 SEG_SMALL = 65536     # байт сегмента для проверки «живой ли»
 SEG_SPEED = 524288    # байт сегмента для замера скорости (основные каналы)
+START_SLOW_MS = 3000  # плейлист + сегмент дольше — поток стартует медленно, ставим за быстрыми
 log_lock = threading.Lock()
 
 
@@ -532,6 +533,7 @@ class Agg:
             1,
             round(self.rate(e["url"]), 1),            # стабильность за последние проверки
             0 if slow else 1,                         # успевает ли сервер отдавать поток
+            0 if r["ms"] > START_SLOW_MS else 1,      # быстро ли стартует: переключение каналов важнее разрешения
             0 if is_regional(e["name"]) else 1,
             min(r["height"] or (1080 if re.search(r"\b(hd|fhd)\b", e["name"], re.I) else 576), 1080),
             1 if e["url"] == cur else 0,              # не скачем между равными
