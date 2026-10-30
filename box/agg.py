@@ -276,6 +276,71 @@ def probe(e, seg_bytes=SEG_SMALL):
     return res
 
 
+# ---------- smotrim: master-плейлист из отдельных вариантов ----------
+# Источники дают stream.smotrim.ru/hls2/<канал>/playlist_N.m3u8 — сразу один вариант (у «России 1» это 1080p,
+# сегменты по 5 МБ), а общий playlist.m3u8 закрыт (403). Плеер тогда не может начать с лёгкого качества.
+# /sm/<hls>/<канал>.m3u8 отдаёт master со всеми видеовариантами (playlist_1…9; _N с субтитрами .vtt пропускаем),
+# BANDWIDTH — по размеру последнего сегмента. Сами варианты плеер берёт прямо со smotrim.
+
+SM_URL = re.compile(r"^https?://stream\.smotrim\.ru/(hls2?)/([\w-]+)/playlist_\d+\.m3u8$")
+SM_CACHE = {}   # (hls, канал) → (master, срок)
+
+
+def sm_variant(base, i):
+    """(BANDWIDTH, адрес) видеоварианта playlist_i или None."""
+    try:
+        text = fetch(f"{base}playlist_{i}.m3u8", timeout=6)[0].decode("utf-8", "replace")
+    except Exception:
+        return None
+    segs = [l for l in text.splitlines() if l and not l.startswith("#")]
+    durs = [float(x) for x in re.findall(r"#EXTINF:([\d.]+)", text)]
+    if not segs or not segs[-1].split("?")[0].endswith(".ts"):
+        return None   # субтитры (.vtt) и пустые
+    bw = 0
+    try:
+        req = urllib.request.Request(urljoin(base, segs[-1]), headers={"User-Agent": DEFAULT_UA, "Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            size = int(r.headers.get("Content-Range", "/0").rsplit("/", 1)[-1] or 0)
+        bw = int(size * 8 / (durs[-1] if durs else 6))
+    except Exception:
+        pass
+    return bw or i * 1_000_000, f"{base}playlist_{i}.m3u8"
+
+
+def sm_master(hls, name, fresh_for=0):
+    """fresh_for — пересобрать, если кэш истекает раньше чем через столько секунд (фоновый прогрев)."""
+    hit = SM_CACHE.get((hls, name))
+    if hit and hit[1] > time.time() + fresh_for:
+        return hit[0]
+    base = f"https://stream.smotrim.ru/{hls}/{name}/"
+    with cf.ThreadPoolExecutor(9) as ex:
+        variants = [v for v in ex.map(lambda i: sm_variant(base, i), range(1, 10)) if v]
+    if not variants:
+        raise LookupError(f"smotrim {hls}/{name}: нет вариантов")
+    lines = ["#EXTM3U"]
+    for bw, url in sorted(variants):
+        lines += [f"#EXT-X-STREAM-INF:BANDWIDTH={bw}", url]
+    master = "\n".join(lines) + "\n"
+    SM_CACHE[(hls, name)] = (master, time.time() + 6 * 3600)   # набор вариантов меняется редко
+    return master
+
+
+def sm_prewarm(keys):
+    """После каждой записи списка — собрать master заранее, чтобы переключение на канал не ждало ~8 с."""
+    def run():
+        for hls, name in keys:
+            try:
+                sm_master(hls, name, fresh_for=3600)
+            except Exception as ex:
+                log(f"smotrim {hls}/{name}: {ex!r}")
+    threading.Thread(target=run, daemon=True).start()
+
+
+def sm_local(url, local):
+    m = SM_URL.match(url)
+    return f"{local}/sm/{m[1]}/{m[2]}.m3u8" if m else None
+
+
 # ---------- кинозалы smotret-online.tv ----------
 # Ссылки на потоки подписаны и живут около часа, поэтому в плейлисте — адрес этого сервера:
 # /kz/<slug>.m3u8 добывает свежую ссылку (страница → iframe плеера → m3u8) и проксирует поток
@@ -659,6 +724,7 @@ class Agg:
                     c["main"][0] if c["main"] else 10 ** 6, c["name"].lower())
 
         report, main_lines, all_lines, player = [], [], [], []
+        sm_keys = set()
         for c in sorted(units, key=key):
             url = self.chosen.get(c["key"])
             best = next((e for e in c["cand"] if e["url"] == url), None)
@@ -689,8 +755,14 @@ class Agg:
             # для своего плеера: выбранный поток первым, затем живые запасные по убыванию качества, сайт — последним
             alive = sorted((e for e in c["cand"] if self.last.get(e["url"], {}).get("ok")),
                            key=lambda e: (e["url"] == url, self.score(e, url)), reverse=True)[:cfg.get("player_streams", 10)]
-            streams = [{"url": e["url"], "ua": e["ua"] or "", "ref": e["ref"] or "",
-                        "hls": bool(self.last[e["url"]].get("hls"))} for e in alive]
+            streams = []
+            for e in alive:
+                sm = sm_local(e["url"], local)
+                if sm:   # сначала master со всеми качествами (старт с лёгкого), исходный вариант — запасным
+                    streams.append({"url": sm, "ua": "", "ref": "", "hls": True})
+                    sm_keys.add(SM_URL.match(e["url"]).groups())
+                streams.append({"url": e["url"], "ua": e["ua"] or "", "ref": e["ref"] or "",
+                                "hls": bool(self.last[e["url"]].get("hls"))})
             if surl:
                 streams.append({"url": surl, "ua": "", "ref": "", "hls": True})
             player.append({"n": len(player) + 1, "name": c["name"], "group": c["group"], "main": bool(c["main"]),
@@ -698,6 +770,7 @@ class Agg:
                            "streams": streams})
             if c["main"]:
                 main_lines += lines
+        sm_prewarm(sorted(sm_keys))
         for fn, ls in (("main.m3u", main_lines), ("playlist.m3u", all_lines)):
             tmp = os.path.join(out, fn + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
@@ -907,6 +980,18 @@ def serve(cfg):
         def do_GET(self):
             if self.path.startswith("/kz/"):
                 return kz_handle(self)
+            m = re.fullmatch(r"/sm/(hls2?)/([\w-]+)\.m3u8", self.path)
+            if m:
+                try:
+                    body = sm_master(m[1], m[2]).encode()
+                except Exception as ex:
+                    log(f"smotrim {self.path}: {ex!r}")
+                    return self.send_error(502)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return self.wfile.write(body)
             if self.path in ("/", "/status"):
                 self.path = "/status.html"
             super().do_GET()
@@ -992,6 +1077,7 @@ def selftest(cfg):
            '<programme start="20261022120000 +0300" stop="20261022130000 +0300" channel="7">\n<title lang="ru">Вести</title>\n</programme>\n').encode()
     assert parse_epg(xml.splitlines(True), one, 0, 2e9) == {"Первый канал": [[1792659600, 1792663200, "Новости"]],
                                                            "Россия 1": [[1792659600, 1792663200, "Вести"]]}
+    assert sm_local("https://stream.smotrim.ru/hls2/russia_hd/playlist_6.m3u8", "http://l") == "http://l/sm/hls2/russia_hd.m3u8"
     assert cfg["sources"] and cfg["out_dir"]
     Agg(dict(cfg, state="/nonexistent/state.json"))
     print("selftest ok")
