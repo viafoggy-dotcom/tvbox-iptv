@@ -434,6 +434,48 @@ def logo_fetch(out, urls):
     threading.Thread(target=run, daemon=True).start()
 
 
+# ---------- результаты диагностики на телевизоре ----------
+# Плеер Samsung прогоняет все источники (out/tvtest.json) и шлёт /zap?stage=test&res=ok|stall|novideo|…&first=мс.
+# Храним по исходному адресу источника (без обёрток /w и /kz/r) в out/tv_results.json и ставим для плеера
+# первыми источники, проверенно быстрые на ТВ; не работающие на ТВ — последними.
+
+TV_RESULTS = {}
+
+
+def tv_key(url):
+    p = urlsplit(url)
+    if p.path in ("/w", "/kz/r"):
+        return parse_qs(p.query).get("u", [url])[0]
+    return url
+
+
+def tv_load(out):
+    global TV_RESULTS
+    try:
+        TV_RESULTS = json.load(open(os.path.join(out, "tv_results.json")))
+    except Exception:
+        TV_RESULTS = {}
+
+
+def tv_record(out, q):
+    url = q.get("url", [""])[0]
+    if not url:
+        return
+    TV_RESULTS[tv_key(url)] = {"res": q.get("res", ["?"])[0], "first": int(q.get("first", ["0"])[0] or 0),
+                               "video": q.get("video", [""])[0], "t": int(time.time())}
+    tmp = os.path.join(out, "tv_results.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(TV_RESULTS, f)
+    os.replace(tmp, os.path.join(out, "tv_results.json"))
+
+
+def tv_rank(stream):
+    r = TV_RESULTS.get(tv_key(stream["url"]))
+    if not r:
+        return (1, 0)
+    return (0, r["first"]) if r["res"] == "ok" else (2, 0)
+
+
 def sm_local(url, local):
     m = SM_URL.match(url)
     return f"{local}/sm/{m[1]}/{m[2]}.m3u8" if m else None
@@ -877,6 +919,8 @@ class Agg:
                                 "v": self.last[e["url"]].get("vcodec", "")})
             if surl:
                 streams.append({"url": surl, "ua": "", "ref": "", "hls": True})
+            if TV_RESULTS:   # проверено на телевизоре: быстрые первыми, неработающие последними (sort устойчив)
+                streams.sort(key=tv_rank)
             logo = c["tvg"].get("logo", "") or (sc or {}).get("logo", "")
             if logo:
                 logos.add(logo)
@@ -1089,6 +1133,7 @@ def epg_loop(cfg):
 def serve(cfg):
     out = os.path.abspath(cfg["out_dir"])
     KZ.index = (cfg.get("site_sections") or [[None]])[0][0]
+    tv_load(out)
 
     class H(SimpleHTTPRequestHandler):
         def __init__(self, *a, **k):
@@ -1123,6 +1168,8 @@ def serve(cfg):
                 return self.wfile.write(body)
             if self.path.startswith("/zap?"):   # замеры переключения от плеера телевизора — в журнал
                 q = parse_qs(urlsplit(self.path).query)
+                if q.get("stage") == ["test"] and q.get("id", [""])[0].startswith("full"):
+                    tv_record(out, q)
                 log("zap " + " ".join(f"{k}={v[0][:300 if k == 'steps' else 90]}" for k, v in q.items()))
                 self.send_response(204)
                 self.end_headers()
