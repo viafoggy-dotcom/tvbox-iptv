@@ -12,6 +12,12 @@
     "https://iptv-org.github.io/iptv/languages/rus.m3u"
   ],
   "epg": "https://iptvx.one/epg/epg_lite.xml.gz",
+  "epg_sources": [
+    "https://iptvx.one/epg/epg_lite.xml.gz",
+    "http://www.teleguide.info/download/new3/xmltv.xml.gz",
+    "http://programtv.ru/xmltv.xml.gz",
+    "http://ru.epg.one/epg.xml.gz"
+  ],
   "epg_every_min": 360,
   "out_dir": "out",
   "state": "state.json",

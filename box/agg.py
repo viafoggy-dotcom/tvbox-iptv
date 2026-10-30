@@ -727,11 +727,14 @@ tr.bad{{color:#b00}}tr:nth-child(even){{background:#f3f3f3}}</style>
 
 
 # ---------- программа передач ----------
-# Раз в epg_every_min качаем XMLTV (cfg["epg"], ~17 МБ gz, >1 млн передач) и оставляем только каналы
-# из channels.json на окно [-3 ч, +48 ч] → epg.json {"updated", "ch": {имя канала: [[начало, конец, название], …]}}.
-# Разбираем построчно байтами (у iptvx.one одна передача — одна строка): на приставке это в разы быстрее ElementTree.
+# Раз в epg_every_min качаем XMLTV из epg_sources и оставляем только каналы из channels.json на окно
+# [-3 ч, +48 ч] → epg.json {"updated", "ch": {имя канала: [[начало, конец, название], …]}}.
+# Источники по порядку: канал берёт программу из первого, где она нашлась. iptvx.one (его id в tvg-id плейлистов)
+# стоит на Cloudflare, и домашний провайдер рвёт к нему TLS — тогда выручают teleguide.info, programtv.ru и
+# ru.epg.one по http (сопоставление по названию и синонимам каталога; у it999 часть каналов бывает устаревшей).
+# Разбираем построчно байтами, а не ElementTree: файлы на 200–400 МБ, на приставке это в разы быстрее и почти без памяти.
 
-EPG_CH = re.compile(rb'<channel id="([^"]+)">(.*)')
+EPG_CH = re.compile(rb'<channel id="([^"]+)"')
 EPG_NAME = re.compile(rb"<display-name[^>]*>([^<]+)</display-name>")
 EPG_PROG = re.compile(rb'<programme start="(\d{14}) ?([+-]\d{4})?" stop="(\d{14}) ?([+-]\d{4})?" channel="([^"]+)"')
 EPG_TITLE = re.compile(rb"<title[^>]*>([^<]*)</title>")
@@ -739,7 +742,7 @@ EPG_TITLE = re.compile(rb"<title[^>]*>([^<]*)</title>")
 
 def name_key(name):
     """Строже norm(): скобки («12 канал (Омск)») не выбрасываем, иначе регионы склеятся."""
-    s = re.sub(r"\s+\b(hd|fhd|uhd|sd|orig)\b\s*$", "", name.lower().replace("ё", "е").strip())
+    s = re.sub(r"\b(hd|fhd|uhd|sd|orig)\b", "", name.lower().replace("ё", "е"))
     return re.sub(r"[^0-9a-zа-я]+", "", s)
 
 
@@ -751,56 +754,96 @@ def xmltv_ts(t, tz):
     return ts
 
 
-def build_epg(cfg):
-    out = cfg["out_dir"]
-    chans = json.load(open(os.path.join(out, "channels.json"), encoding="utf-8"))["channels"]
+def parse_epg(lines, chans, lo, hi):
+    """XMLTV построчно; элемент может занимать одну строку (iptvx.one) или несколько (it999/epg.one)."""
     ids, by_name = {}, {}
     for c in chans:
         if c["tvg"]:
             ids.setdefault(c["tvg"], []).append(c["name"])
         by_name.setdefault(name_key(c["name"]), []).append(c["name"])
-    own, by_dn = {}, {}                      # имя канала → программа по tvg-id / по названию
+    have = {c["name"] for c in chans}
+    for _, canon, al in MAIN:                # синонимы каталога: «Культура» → «Россия К», «Матч!» → «Матч ТВ»
+        if canon in have:
+            for a in al:
+                k = by_name.setdefault(name_key(a), [])
+                if canon not in k:
+                    k.append(canon)
+    # имя канала → кандидаты в программе по приоритету: свой tvg-id, затем основное название, затем запасные.
+    # «Россия 1» бывает запасным названием у регионального дубля без передач — поэтому берём первого непустого.
+    cands = {}
     want = None                              # id программы → имена каналов плейлиста
-    progs, n_ch, t0 = {}, 0, time.time()
-    lo, hi = time.time() - 3 * 3600, time.time() + 48 * 3600
-    req = urllib.request.Request(cfg["epg"], headers={"User-Agent": DEFAULT_UA})
-    with urllib.request.urlopen(req, timeout=60) as r, gzip.GzipFile(fileobj=r) as f:
-        for line in f:
-            if line.startswith(b"<programme"):
-                if want is None:             # в XMLTV все <channel> идут до передач — сопоставляем один раз
-                    want = {}
-                    for name, cid in {**by_dn, **own}.items():
-                        want.setdefault(cid, []).append(name)
-                m = EPG_PROG.match(line)
-                if not m or m.group(5) not in want:
-                    continue
+    got, ch, cur = {}, None, None            # (имя, id) → передачи
+    for line in lines:
+        s = line.lstrip()
+        if s.startswith(b"<programme"):
+            if want is None:                 # в XMLTV все <channel> идут до передач — сопоставляем один раз
+                want = {}
+                for name, cs in cands.items():
+                    for _, cid in cs:
+                        if name not in want.setdefault(cid, []):
+                            want[cid].append(name)
+            cur = None
+            m = EPG_PROG.match(s)
+            if m and m.group(5) in want:
                 a, b = xmltv_ts(m.group(1), m.group(2)), xmltv_ts(m.group(3), m.group(4))
-                if b < lo or a > hi:
-                    continue
-                t = EPG_TITLE.search(line)
-                title = html.unescape(t.group(1).decode("utf-8", "replace")).strip() if t else ""
-                for name in want[m.group(5)]:
-                    progs.setdefault(name, []).append([a, b, title])
-            elif line.startswith(b"<channel"):
-                m = EPG_CH.match(line)
-                if not m:
-                    continue
-                n_ch += 1
-                cid = m.group(1)
+                if b > lo and a < hi:
+                    cur = (a, b, want[m.group(5)], m.group(5))
+        elif s.startswith(b"<channel"):
+            m = EPG_CH.match(s)
+            ch = (m.group(1), []) if m else None
+        if ch is not None:
+            ch[1].extend(EPG_NAME.findall(line))
+            if b"</channel>" in line:
+                cid = ch[0]
                 for name in ids.get(cid.decode(), []):
-                    own[name] = cid
-                for dn in EPG_NAME.findall(m.group(2)):   # канал без своего tvg-id — по названию (первое совпадение)
+                    cands.setdefault(name, []).append((0, cid))
+                for i, dn in enumerate(ch[1]):
                     for name in by_name.get(name_key(html.unescape(dn.decode("utf-8", "replace"))), []):
-                        by_dn.setdefault(name, cid)
+                        cands.setdefault(name, []).append((1 if i == 0 else 2, cid))
+                ch = None
+        if cur is not None:
+            t = EPG_TITLE.search(line)
+            if t or b"</programme>" in line:
+                title = html.unescape(t.group(1).decode("utf-8", "replace")) if t else ""
+                title = re.sub(r"\s*[(\[]\d{1,2}\+[)\]]\s*$", "", title.strip())   # «Время покажет (16+)»
+                for name in cur[2]:
+                    got.setdefault((name, cur[3]), []).append([cur[0], cur[1], title])
+                cur = None
+    progs = {}
+    for name, cs in cands.items():
+        for _, cid in sorted(cs, key=lambda x: x[0]):   # sorted устойчив: внутри приоритета — порядок файла
+            if got.get((name, cid)):
+                progs[name] = got[(name, cid)]
+                break
+    return progs
+
+
+def build_epg(cfg):
+    out = cfg["out_dir"]
+    chans = json.load(open(os.path.join(out, "channels.json"), encoding="utf-8"))["channels"]
+    lo, hi = time.time() - 3 * 3600, time.time() + 48 * 3600
+    progs = {}
+    for url in cfg.get("epg_sources") or [cfg["epg"]]:
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+            with urllib.request.urlopen(req, timeout=60) as r, gzip.GzipFile(fileobj=r) as f:
+                got = parse_epg(f, chans, lo, hi)
+        except Exception as ex:
+            log(f"программа {url}: {ex!r}")
+            continue
+        new = {k: v for k, v in got.items() if k not in progs}
+        progs.update(new)
+        log(f"программа {url}: {len(got)} каналов, новых {len(new)}, {int(time.time() - t0)} с")
     for v in progs.values():
         v.sort()
     if not progs:
-        raise ValueError(f"в программе ни одного нашего канала (каналов в файле {n_ch})")
+        raise ValueError("ни один источник программы не дал наших каналов")
     tmp = os.path.join(out, "epg.json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"updated": int(time.time()), "ch": progs}, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, os.path.join(out, "epg.json"))
-    log(f"программа: {len(progs)} из {len(chans)} каналов, {sum(map(len, progs.values()))} передач, {int(time.time() - t0)} с")
+    log(f"программа: {len(progs)} из {len(chans)} каналов, {sum(map(len, progs.values()))} передач")
 
 
 def epg_loop(cfg):
@@ -909,7 +952,14 @@ def selftest(cfg):
     assert "http://l/kz/s.m3u8?v=0" in pl
     assert "/kz/r?u=" in kz_rewrite("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi.m3u8\n", "https://c/", "https://p/x", "http://l", "")
     assert xmltv_ts(b"20261022120000", b"+0300") == 1792659600
-    assert name_key("12 канал (Омск) HD") == "12каналомск"
+    assert name_key("12 канал (Омск) HD") == "12каналомск" == name_key("12 канал HD (Омск)")
+    one = [{"name": "Первый канал", "tvg": "pervy"}, {"name": "Россия 1", "tvg": ""}]
+    xml = ('<channel id="pervy"><display-name>Первый</display-name></channel>\n<channel id="7">\n'
+           '<display-name lang="ru">Россия 1 HD</display-name>\n</channel>\n'
+           '<programme start="20261022120000 +0300" stop="20261022130000 +0300" channel="pervy"><title>Новости</title></programme>\n'
+           '<programme start="20261022120000 +0300" stop="20261022130000 +0300" channel="7">\n<title lang="ru">Вести</title>\n</programme>\n').encode()
+    assert parse_epg(xml.splitlines(True), one, 0, 2e9) == {"Первый канал": [[1792659600, 1792663200, "Новости"]],
+                                                           "Россия 1": [[1792659600, 1792663200, "Вести"]]}
     assert cfg["sources"] and cfg["out_dir"]
     Agg(dict(cfg, state="/nonexistent/state.json"))
     print("selftest ok")
