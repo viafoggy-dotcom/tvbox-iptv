@@ -765,7 +765,9 @@ class Agg:
             r = self.last.get(url, {}) if best else {}
             ok = bool(r.get("ok"))
             sc = site.get(c["key"])
-            surl = f"{local}/kz/{sc['slug']}.m3u8" if sc and (sc["ok"] or not any_ok) else None
+            # у наших каналов поток сайта — всегда последним запасным (проверка могла не пройти случайно, а он
+            # бывает единственным рабочим, как у «Мира»); канал только с сайта — если поток добылся или сайт лёг целиком
+            surl = f"{local}/kz/{sc['slug']}.m3u8" if sc and (sc["ok"] or not any_ok or c["cand"]) else None
             report.append({
                 "channel": c["name"], "group": c["group"], "main": bool(c["main"]), "ok": ok or bool(surl),
                 "alive": sum(1 for e in c["cand"] if self.last.get(e["url"], {}).get("ok")) + bool(surl),
