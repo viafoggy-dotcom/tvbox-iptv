@@ -9,9 +9,11 @@
   all_every_min   — то же для всех каналов
   full_every_min  — заново скачать источники, проверить все варианты, переизбрать лучших
 
-Отдаёт: /playlist.m3u (основные, затем все остальные), /main.m3u, /status, /status.json.
+Отдаёт: /playlist.m3u (основные, затем все остальные), /main.m3u, /channels.json и /epg.json (свой плеер),
+/status, /status.json.
 Кинозалы smotret-online.tv (ключ kinozals в config) — группой в конце playlist.m3u, потоки через /kz/.
 """
+import calendar
 import concurrent.futures as cf
 import gzip
 import hashlib
@@ -724,6 +726,99 @@ tr.bad{{color:#b00}}tr:nth-child(even){{background:#f3f3f3}}</style>
 {''.join(rows)}</table>"""
 
 
+# ---------- программа передач ----------
+# Раз в epg_every_min качаем XMLTV (cfg["epg"], ~17 МБ gz, >1 млн передач) и оставляем только каналы
+# из channels.json на окно [-3 ч, +48 ч] → epg.json {"updated", "ch": {имя канала: [[начало, конец, название], …]}}.
+# Разбираем построчно байтами (у iptvx.one одна передача — одна строка): на приставке это в разы быстрее ElementTree.
+
+EPG_CH = re.compile(rb'<channel id="([^"]+)">(.*)')
+EPG_NAME = re.compile(rb"<display-name[^>]*>([^<]+)</display-name>")
+EPG_PROG = re.compile(rb'<programme start="(\d{14}) ?([+-]\d{4})?" stop="(\d{14}) ?([+-]\d{4})?" channel="([^"]+)"')
+EPG_TITLE = re.compile(rb"<title[^>]*>([^<]*)</title>")
+
+
+def name_key(name):
+    """Строже norm(): скобки («12 канал (Омск)») не выбрасываем, иначе регионы склеятся."""
+    s = re.sub(r"\s+\b(hd|fhd|uhd|sd|orig)\b\s*$", "", name.lower().replace("ё", "е").strip())
+    return re.sub(r"[^0-9a-zа-я]+", "", s)
+
+
+def xmltv_ts(t, tz):
+    ts = calendar.timegm((int(t[:4]), int(t[4:6]), int(t[6:8]), int(t[8:10]), int(t[10:12]), int(t[12:14]), 0, 0, 0))
+    if tz:
+        off = int(tz[1:3]) * 3600 + int(tz[3:5]) * 60
+        ts -= off if tz[:1] == b"+" else -off
+    return ts
+
+
+def build_epg(cfg):
+    out = cfg["out_dir"]
+    chans = json.load(open(os.path.join(out, "channels.json"), encoding="utf-8"))["channels"]
+    ids, by_name = {}, {}
+    for c in chans:
+        if c["tvg"]:
+            ids.setdefault(c["tvg"], []).append(c["name"])
+        by_name.setdefault(name_key(c["name"]), []).append(c["name"])
+    own, by_dn = {}, {}                      # имя канала → программа по tvg-id / по названию
+    want = None                              # id программы → имена каналов плейлиста
+    progs, n_ch, t0 = {}, 0, time.time()
+    lo, hi = time.time() - 3 * 3600, time.time() + 48 * 3600
+    req = urllib.request.Request(cfg["epg"], headers={"User-Agent": DEFAULT_UA})
+    with urllib.request.urlopen(req, timeout=60) as r, gzip.GzipFile(fileobj=r) as f:
+        for line in f:
+            if line.startswith(b"<programme"):
+                if want is None:             # в XMLTV все <channel> идут до передач — сопоставляем один раз
+                    want = {}
+                    for name, cid in {**by_dn, **own}.items():
+                        want.setdefault(cid, []).append(name)
+                m = EPG_PROG.match(line)
+                if not m or m.group(5) not in want:
+                    continue
+                a, b = xmltv_ts(m.group(1), m.group(2)), xmltv_ts(m.group(3), m.group(4))
+                if b < lo or a > hi:
+                    continue
+                t = EPG_TITLE.search(line)
+                title = html.unescape(t.group(1).decode("utf-8", "replace")).strip() if t else ""
+                for name in want[m.group(5)]:
+                    progs.setdefault(name, []).append([a, b, title])
+            elif line.startswith(b"<channel"):
+                m = EPG_CH.match(line)
+                if not m:
+                    continue
+                n_ch += 1
+                cid = m.group(1)
+                for name in ids.get(cid.decode(), []):
+                    own[name] = cid
+                for dn in EPG_NAME.findall(m.group(2)):   # канал без своего tvg-id — по названию (первое совпадение)
+                    for name in by_name.get(name_key(html.unescape(dn.decode("utf-8", "replace"))), []):
+                        by_dn.setdefault(name, cid)
+    for v in progs.values():
+        v.sort()
+    if not progs:
+        raise ValueError(f"в программе ни одного нашего канала (каналов в файле {n_ch})")
+    tmp = os.path.join(out, "epg.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"updated": int(time.time()), "ch": progs}, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, os.path.join(out, "epg.json"))
+    log(f"программа: {len(progs)} из {len(chans)} каналов, {sum(map(len, progs.values()))} передач, {int(time.time() - t0)} с")
+
+
+def epg_loop(cfg):
+    """Отдельная нить: разбор занимает минуту-другую процессора и не должен задерживать проверку потоков."""
+    path = os.path.join(cfg["out_dir"], "epg.json")
+    every = cfg.get("epg_every_min", 360) * 60
+    while True:
+        try:
+            age = time.time() - os.path.getmtime(path) if os.path.exists(path) else every
+            if age >= every and os.path.exists(os.path.join(cfg["out_dir"], "channels.json")):
+                build_epg(cfg)
+                continue
+        except Exception as ex:
+            log("программа:", repr(ex))
+            time.sleep(1800)          # сайт программы лежит — старый epg.json покрывает ещё двое суток
+        time.sleep(300)
+
+
 # ---------- сервис ----------
 
 def serve(cfg):
@@ -813,6 +908,8 @@ def selftest(cfg):
     pl = kz_rewrite("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi/index.m3u8\n", "https://c/2051/index.m3u8", "https://p/x", "http://l", "s")
     assert "http://l/kz/s.m3u8?v=0" in pl
     assert "/kz/r?u=" in kz_rewrite("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi.m3u8\n", "https://c/", "https://p/x", "http://l", "")
+    assert xmltv_ts(b"20261022120000", b"+0300") == 1792659600
+    assert name_key("12 канал (Омск) HD") == "12каналомск"
     assert cfg["sources"] and cfg["out_dir"]
     Agg(dict(cfg, state="/nonexistent/state.json"))
     print("selftest ok")
@@ -842,6 +939,8 @@ def main():
                 os._exit(3)
 
     threading.Thread(target=watchdog, daemon=True).start()
+    if cfg.get("epg"):
+        threading.Thread(target=epg_loop, args=(cfg,), daemon=True).start()
     every = {"full": cfg.get("full_every_min", 720), "all": cfg.get("all_every_min", 120), "main": cfg.get("main_every_min", 30)}
     due = {lvl: 0 for lvl in every}
     flag = cfg.get("restart_flag")
