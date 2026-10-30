@@ -344,7 +344,7 @@ def sm_prewarm(keys):
 W_CACHE = {}   # адрес → (текст, срок)
 # CDN, где ссылки из плейлиста привязаны к запросившему (mirtv: ?hls_proxy_host=…) — плейлист с NAS, а видео
 # напрямую не сходятся. Такие потоки целиком идут через NAS (/kz/r, как потоки сайта): ~6 Мбит/с на канал.
-RELAY_HOSTS = re.compile(r"(^|\.)hls-?mirtv\.cdnvideo\.ru$")
+RELAY_HOSTS = re.compile(r"(^|[.-])mirtv\.cdnvideo\.ru$")
 
 
 def wrap_master(url, ua=None):
