@@ -378,26 +378,137 @@ W_CACHE = {}   # адрес → (текст, срок)
 RELAY_HOSTS = re.compile(r"(^|[.-])mirtv\.cdnvideo\.ru$")
 
 
-def wrap_master(url, ua=None):
+def abs_playlist(text, base, link=lambda u: u):
+    """Ссылки плейлиста (строки и URI="…") — абсолютные, каждая через link()."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            line = link(urljoin(base, line))
+        elif 'URI="' in line:
+            line = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{link(urljoin(base, m.group(1)))}"', line)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+LIVE_KEEP = 8   # сегментов живого хвоста
+HEAD_TAGS = ("#EXTM3U", "#EXT-X-VERSION", "#EXT-X-TARGETDURATION", "#EXT-X-MEDIA-SEQUENCE", "#EXT-X-PLAYLIST-TYPE",
+             "#EXT-X-DISCONTINUITY-SEQUENCE", "#EXT-X-INDEPENDENT-SEGMENTS", "#EXT-X-ALLOW-CACHE", "#EXT-X-START")
+
+
+def trim_live(text, keep=LIVE_KEEP):
+    """Плейлист с перемоткой (Матч ТВ — 301 сегмент, webcaster — 454, Setanta — 3750) AVPlay разбирает
+    секундами, на ТВ такие каналы стартовали за 10–12 с. Оставляем живой хвост; номер первого сегмента,
+    счётчик разрывов, действующие ключ и инициализацию переносим, чтобы хвост читался как исходный."""
+    if "#EXT-X-ENDLIST" in text or "#EXT-X-STREAM-INF" in text:
+        return text
+    head, blocks, cur = [], [], []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if not s.startswith("#"):
+            blocks.append((cur, s))
+            cur = []
+        elif not blocks and not cur and s.startswith(HEAD_TAGS):
+            head.append(s)
+        else:
+            cur.append(s)
+    if len(blocks) <= keep * 2:
+        return text
+    dropped = blocks[:-keep]
+    carry, disc = {}, 0
+    for tags, _ in dropped:
+        for t in tags:
+            if t.startswith(("#EXT-X-KEY", "#EXT-X-MAP")):
+                carry[t[:10]] = t
+            elif t == "#EXT-X-DISCONTINUITY":
+                disc += 1
+    first = blocks[-keep][0]
+    out, seq, dseq = [], len(dropped), disc
+    for h in head:
+        if h.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            seq += int(h.split(":", 1)[1] or 0)
+            continue
+        if h.startswith("#EXT-X-DISCONTINUITY-SEQUENCE:"):
+            dseq += int(h.split(":", 1)[1] or 0)
+            continue
+        if not h.startswith("#EXT-X-PLAYLIST-TYPE"):   # EVENT/VOD после обрезки неправда
+            out.append(h)
+    out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq}")
+    if dseq:
+        out.append(f"#EXT-X-DISCONTINUITY-SEQUENCE:{dseq}")
+    out += [t for k, t in carry.items() if not any(x.startswith(k) for x in first)]
+    for tags, uri in blocks[-keep:]:
+        out += tags + [uri]
+    return "\n".join(out + cur) + "\n"
+
+
+# Вариант тоже идёт через NAS (/wv): длинный хвост обрезаем, а только что скачанный (вместе с master)
+# отдаём из памяти — плееру не ждать второго запроса к источнику.
+V_CACHE = {}   # адрес варианта → (текст, срок)
+V_WAIT = {}    # адрес → Event, пока его качают
+V_LOCK = threading.Lock()
+
+
+def wv_local(url, ua, local):
+    return f"{local}/wv?u={quote(url, safe='')}" + (f"&ua={quote(ua, safe='')}" if ua else "")
+
+
+def wv_put(url, body, final):
+    text = trim_live(abs_playlist(body.decode("utf-8", "replace"), final))
+    with V_LOCK:
+        V_CACHE[url] = (text, time.time() + 2)
+        if len(V_CACHE) > 200:
+            V_CACHE.clear()
+    return text
+
+
+def wv_get(url, ua=None):
+    with V_LOCK:
+        hit = V_CACHE.get(url)
+        if hit and hit[1] > time.time():
+            return hit[0]
+        ev = V_WAIT.get(url)
+        mine = ev is None
+        if mine:
+            ev = V_WAIT[url] = threading.Event()
+    if not mine:   # этот вариант уже качают (заранее, вместе с master) — ждём его
+        ev.wait(10)
+        with V_LOCK:
+            hit = V_CACHE.get(url)
+        if hit:
+            return hit[0]
+        raise LookupError("вариант не скачался")
+    try:
+        body, final, _ = fetch(url, ua or DEFAULT_UA, 4 << 20, 8)
+        if b"#EXTM3U" not in body[:1024]:
+            raise LookupError("не плейлист")
+        return wv_put(url, body, final)
+    finally:
+        with V_LOCK:
+            V_WAIT.pop(url, None)
+        ev.set()
+
+
+def wrap_master(url, ua=None, local=""):
     hit = W_CACHE.get(url)
     if hit and hit[1] > time.time():
         return hit[0]
-    body, final, _ = fetch(url, ua or DEFAULT_UA, 262144, 8)
+    body, final, _ = fetch(url, ua or DEFAULT_UA, 4 << 20, 8)
     text = body.decode("utf-8", "replace")
     if "#EXTM3U" not in text:
         raise LookupError("не плейлист")
     if "#EXT-X-STREAM-INF" in text:
-        out = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                line = urljoin(final, line)
-            elif 'URI="' in line:
-                line = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{urljoin(final, m.group(1))}"', line)
-            out.append(line)
-        master = "\n".join(out) + "\n"
+        master = abs_playlist(text, final, lambda u: wv_local(u, ua, local))
+        # плеер начнёт с самого лёгкого (STARTBITRATE=LOWEST) — качаем его, пока плеер разбирает master
+        bw = [(int(m[1]), urljoin(final, m[2].strip())) for m in
+              re.finditer(r"#EXT-X-STREAM-INF:[^\n]*?BANDWIDTH=(\d+)[^\n]*\n([^#\n][^\n]*)", text)]
+        if bw:
+            threading.Thread(target=lambda: wv_get(min(bw)[1], ua), daemon=True).start()
     else:
-        master = f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\n{final}\n"
+        wv_put(final, body, final)
+        master = f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\n{wv_local(final, ua, local)}\n"
     W_CACHE[url] = (master, time.time() + 30)   # у dmi3y хост варианта меняется — держим недолго
     if len(W_CACHE) > 500:
         W_CACHE.clear()
@@ -462,7 +573,8 @@ def tv_record(out, q):
     if not url:
         return
     TV_RESULTS[tv_key(url)] = {"res": q.get("res", ["?"])[0], "first": int(q.get("first", ["0"])[0] or 0),
-                               "video": q.get("video", [""])[0], "t": int(time.time())}
+                               "video": q.get("video", [""])[0], "t": int(time.time()),
+                               "via": "relay" if urlsplit(url).path == "/kz/r" else ""}
     tmp = os.path.join(out, "tv_results.json.tmp")
     with open(tmp, "w") as f:
         json.dump(TV_RESULTS, f)
@@ -474,6 +586,13 @@ def tv_rank(stream):
     if not r:
         return (1, 0)
     return (0, r["first"]) if r["res"] == "ok" else (2, 0)
+
+
+def tv_relay(url):
+    """Источник, который у ТВ не стартует, а у сборщика работает (ТВ ходит через DNS роутера на другие узлы
+    CDN, часть — через туннель; плюс https на Tizen 5.5), — целиком через NAS. Раз прошёл так — так и оставляем."""
+    r = TV_RESULTS.get(url)
+    return bool(r) and (r.get("via") == "relay" or r["res"].split("-")[0] in ("timeout", "error", "stall"))
 
 
 def sm_local(url, local):
@@ -521,8 +640,12 @@ def kz_page(url, referer=None):
         return r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
 
 
-def kz_open(url, ref, timeout=15):
-    """Поток или сегмент: CDN ждёт Origin/Referer плеера, со страницы которого взята ссылка."""
+def kz_open(url, ref, timeout=15, ua=None):
+    """Поток или сегмент: CDN ждёт Origin/Referer плеера, со страницы которого взята ссылка.
+    Без ref — обычный источник, который ТВ сам не тянет: идём как сборщик, с его UA."""
+    if not ref:
+        h = {"User-Agent": ua or DEFAULT_UA}
+        return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
     o = kz_origin(ref)
     h = {"User-Agent": KZ_UA, "Accept": "*/*", "Accept-Language": "ru", "Origin": o, "Referer": o + "/"}
     return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
@@ -601,11 +724,16 @@ class KzLinks:
 KZ = KzLinks()
 
 
-def kz_rewrite(text, base_url, ref, local, slug):
+def kz_relay(url, ref, local, ua=""):
+    return f"{local}/kz/r?u={quote(url, safe='')}&ref={quote(ref, safe='')}" + (f"&ua={quote(ua, safe='')}" if ua else "")
+
+
+def kz_rewrite(text, base_url, ref, local, slug, ua=""):
     """Все адреса плейлиста — через нас. Варианты master-плейлиста ссылаются на /kz/<slug>.m3u8?v=N,
     чтобы при обновлении плейлиста подпись бралась свежая, а не та, что была при старте."""
     def wrap(u):
-        return f"{local}/kz/r?u={quote(urljoin(base_url, u), safe='')}&ref={quote(ref, safe='')}"
+        return kz_relay(urljoin(base_url, u), ref, local, ua)
+    text = trim_live(text)
     master = bool(slug) and "#EXT-X-STREAM-INF" in text
     out, var = [], 0
     for line in text.splitlines():
@@ -664,13 +792,13 @@ def kz_handle(h):
                 KZ.drop(m[1])   # подпись истекла раньше срока или сменился IP — добываем заново
                 return playlist(m[1], q.get("v", [None])[0])
         if path == "/kz/r" and "u" in q:
-            ref = q.get("ref", [""])[0]
-            with kz_open(q["u"][0], ref, timeout=20) as r:
+            ref, ua = q.get("ref", [""])[0], q.get("ua", [""])[0]
+            with kz_open(q["u"][0], ref, timeout=20, ua=ua) as r:
                 ctype = r.headers.get("Content-Type", "")
                 head = r.read(7)   # livetv.php отдаёт плейлисты без mpegurl и без .m3u8 в пути
                 if head == b"#EXTM3U" or "mpegurl" in ctype.lower():
                     text = (head + r.read()).decode("utf-8", "replace")
-                    return send(kz_rewrite(text, r.geturl(), ref, local, "").encode(), "application/vnd.apple.mpegurl")
+                    return send(kz_rewrite(text, r.geturl(), ref, local, "", ua).encode(), "application/vnd.apple.mpegurl")
                 h.send_response(200)
                 # tvcdnpotok отдаёт сегменты как text/plain — часть плееров тогда не показывает картинку
                 h.send_header("Content-Type", "video/mp2t" if not ctype or ctype.startswith("text/") else ctype)
@@ -912,7 +1040,9 @@ class Agg:
                 hls = bool(self.last[e["url"]].get("hls"))
                 u = e["url"]
                 if hls and RELAY_HOSTS.search(urlsplit(u).hostname or ""):
-                    u = f"{local}/kz/r?u={quote(u, safe='')}&ref={quote(kz_origin(u) + '/', safe='')}"
+                    u = kz_relay(u, kz_origin(u) + "/", local)
+                elif hls and not e["ref"] and tv_relay(u):
+                    u = kz_relay(u, "", local, e["ua"] or "")
                 elif hls and not e["ref"]:   # первый плейлист — с NAS: так AVPlay не виснет на подготовке
                     u = f"{local}/w?u={quote(u, safe='')}" + (f"&ua={quote(e['ua'], safe='')}" if e["ua"] else "")
                 streams.append({"url": u, "ua": e["ua"] or "", "ref": e["ref"] or "", "hls": hls,
@@ -1154,10 +1284,14 @@ def serve(cfg):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 return self.wfile.write(body)
-            if self.path.startswith("/w?"):
+            if self.path.startswith(("/w?", "/wv?")):
                 q = parse_qs(urlsplit(self.path).query)
+                ua = q.get("ua", [None])[0]
                 try:
-                    body = wrap_master(q["u"][0], q.get("ua", [None])[0]).encode()
+                    if self.path.startswith("/wv?"):
+                        body = wv_get(q["u"][0], ua).encode()
+                    else:
+                        body = wrap_master(q["u"][0], ua, f"http://{self.headers.get('Host')}").encode()
                 except Exception as ex:
                     log(f"обёртка {q.get('u', ['?'])[0][:80]}: {ex!r}")
                     return self.send_error(502)
@@ -1276,6 +1410,16 @@ def selftest(cfg):
                   0x02, 0xe1, 0x01, 0xf0, 0x00]) + bytes(166)
     assert ts_video_codec(seg) == "mpeg2", ts_video_codec(seg)
     assert sm_local("https://stream.smotrim.ru/hls2/russia_hd/playlist_6.m3u8", "http://l") == "http://l/sm/hls2/russia_hd.m3u8"
+    dvr = ("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-PLAYLIST-TYPE:EVENT\n"
+           '#EXT-X-KEY:METHOD=AES-128,URI="k1"\n' + "".join(
+               ("#EXT-X-DISCONTINUITY\n" if i == 3 else "") + f"#EXTINF:6,\ns{i}.ts\n" for i in range(30)))
+    t = trim_live(dvr)
+    assert t.count("#EXTINF") == LIVE_KEEP and "s29.ts" in t and "s21.ts" not in t and "s22.ts" in t
+    assert "#EXT-X-MEDIA-SEQUENCE:122" in t and "#EXT-X-DISCONTINUITY-SEQUENCE:1" in t
+    assert 'URI="k1"' in t and "PLAYLIST-TYPE" not in t and t.index("KEY") < t.index("s22.ts")
+    assert trim_live(dvr + "#EXT-X-ENDLIST\n") == dvr + "#EXT-X-ENDLIST\n"
+    assert "/wv?u=https%3A%2F%2Fc%2Fhi.m3u8" in abs_playlist(
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi.m3u8\n", "https://c/m.m3u8", lambda u: wv_local(u, "", "http://l"))
     assert cfg["sources"] and cfg["out_dir"]
     Agg(dict(cfg, state="/nonexistent/state.json"))
     print("selftest ok")
