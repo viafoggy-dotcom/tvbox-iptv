@@ -114,7 +114,7 @@ def fetch(url, ua=DEFAULT_UA, n=None, timeout=10, referer=None):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = r.read(n) if n else r.read()
         ctype = r.headers.get("Content-Type", "")
-        if body[:2] == b"\x1f\x8b" and ("mpegurl" in ctype.lower() or r.geturl().split("?")[0].endswith((".m3u8", ".m3u"))):
+        while body[:2] == b"\x1f\x8b" and ("mpegurl" in ctype.lower() or r.geturl().split("?")[0].endswith((".m3u8", ".m3u"))):
             body = gzip.decompress(body)   # некоторые CDN (cdn.ntv.ru) жмут плейлист без Content-Encoding
         return body, r.geturl(), ctype
 
@@ -378,15 +378,21 @@ W_CACHE = {}   # адрес → (текст, срок)
 RELAY_HOSTS = re.compile(r"(^|[.-])mirtv\.cdnvideo\.ru$")
 
 
+def seg_join(base, u):
+    """urljoin без «//» в пути: cdn-dvr.ntv.ru перенаправляет на …ru//Shef/…, а сегменты по такому пути не отдаёт."""
+    p = urlsplit(urljoin(base, u))
+    return p._replace(path=re.sub(r"/{2,}", "/", p.path)).geturl()
+
+
 def abs_playlist(text, base, link=lambda u: u):
     """Ссылки плейлиста (строки и URI="…") — абсолютные, каждая через link()."""
     out = []
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            line = link(urljoin(base, line))
+            line = link(seg_join(base, line))
         elif 'URI="' in line:
-            line = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{link(urljoin(base, m.group(1)))}"', line)
+            line = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{link(seg_join(base, m.group(1)))}"', line)
         out.append(line)
     return "\n".join(out) + "\n"
 
@@ -732,7 +738,7 @@ def kz_rewrite(text, base_url, ref, local, slug, ua=""):
     """Все адреса плейлиста — через нас. Варианты master-плейлиста ссылаются на /kz/<slug>.m3u8?v=N,
     чтобы при обновлении плейлиста подпись бралась свежая, а не та, что была при старте."""
     def wrap(u):
-        return kz_relay(urljoin(base_url, u), ref, local, ua)
+        return kz_relay(seg_join(base_url, u), ref, local, ua)
     text = trim_live(text)
     master = bool(slug) and "#EXT-X-STREAM-INF" in text
     out, var = [], 0
@@ -796,8 +802,12 @@ def kz_handle(h):
             with kz_open(q["u"][0], ref, timeout=20, ua=ua) as r:
                 ctype = r.headers.get("Content-Type", "")
                 head = r.read(7)   # livetv.php отдаёт плейлисты без mpegurl и без .m3u8 в пути
-                if head == b"#EXTM3U" or "mpegurl" in ctype.lower():
-                    text = (head + r.read()).decode("utf-8", "replace")
+                packed = head[:2] == b"\x1f\x8b" and ("mpegurl" in ctype.lower() or ".m3u8" in urlsplit(r.geturl()).path)
+                if head == b"#EXTM3U" or "mpegurl" in ctype.lower() or packed:
+                    body = head + r.read()
+                    while body[:2] == b"\x1f\x8b":   # cdn(-dvr).ntv.ru жмёт плейлисты gzip (бывает дважды)
+                        body = gzip.decompress(body)   # без Content-Encoding — ТВ их не читает
+                    text = body.decode("utf-8", "replace")
                     return send(kz_rewrite(text, r.geturl(), ref, local, "", ua).encode(), "application/vnd.apple.mpegurl")
                 h.send_response(200)
                 # tvcdnpotok отдаёт сегменты как text/plain — часть плееров тогда не показывает картинку
@@ -1417,6 +1427,7 @@ def selftest(cfg):
     assert t.count("#EXTINF") == LIVE_KEEP and "s29.ts" in t and "s21.ts" not in t and "s22.ts" in t
     assert "#EXT-X-MEDIA-SEQUENCE:122" in t and "#EXT-X-DISCONTINUITY-SEQUENCE:1" in t
     assert 'URI="k1"' in t and "PLAYLIST-TYPE" not in t and t.index("KEY") < t.index("s22.ts")
+    assert seg_join("https://c.ru//Shef/v/mono.m3u8", "a.ts") == "https://c.ru/Shef/v/a.ts"
     assert trim_live(dvr + "#EXT-X-ENDLIST\n") == dvr + "#EXT-X-ENDLIST\n"
     assert "/wv?u=https%3A%2F%2Fc%2Fhi.m3u8" in abs_playlist(
         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi.m3u8\n", "https://c/m.m3u8", lambda u: wv_local(u, "", "http://l"))
