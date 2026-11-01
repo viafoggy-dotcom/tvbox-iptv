@@ -497,6 +497,76 @@ def wv_get(url, ua=None):
         ev.set()
 
 
+def ts_pump(url, ua, wfile, stop_after=6 * 3600):
+    """/ts?u=<hls>: HLS → сплошной MPEG-TS. Плеер Samsung внутри HLS не показывает MPEG-2 (только звук),
+    а обычный TS-поток по HTTP играет — телевизор сам декодирует MPEG-2, как эфир. Без перекодирования:
+    берём самый лёгкий вариант, отдаём два последних сегмента и дальше каждый новый по порядку."""
+    body, final, _ = fetch(url, ua or DEFAULT_UA, 4 << 20, 8)
+    text = body.decode("utf-8", "replace")
+    if "#EXT-X-STREAM-INF" in text:
+        bw = [(int(m[1]), seg_join(final, m[2].strip())) for m in
+              re.finditer(r"#EXT-X-STREAM-INF:[^\n]*?BANDWIDTH=(\d+)[^\n]*\n([^#\n][^\n]*)", text)]
+        final = min(bw)[1]
+    sent, t_end, first = set(), time.time() + stop_after, True
+    while time.time() < t_end:
+        body, base, _ = fetch(final, ua or DEFAULT_UA, 4 << 20, 8)
+        text = body.decode("utf-8", "replace")
+        segs = [seg_join(base, l.strip()) for l in text.splitlines() if l.strip() and not l.startswith("#")]
+        td = re.search(r"#EXT-X-TARGETDURATION:(\d+)", text)
+        new = [s for s in (segs[-2:] if first else segs) if s not in sent]
+        first = False
+        for s in new:
+            with urllib.request.urlopen(urllib.request.Request(s, headers={"User-Agent": ua or DEFAULT_UA}), timeout=20) as r:
+                shutil.copyfileobj(r, wfile, 65536)
+            sent.add(s)
+        if len(sent) > 500:
+            sent = set(segs)
+        if not new:
+            time.sleep(max(1, int(td[1]) // 2 if td else 2))
+
+
+# ---------- перекодирование MPEG-2 → H.264 (/tc) ----------
+# Плеер Samsung не декодирует MPEG-2 ни в HLS, ни сплошным TS (проверено: только звук). На NAS (config
+# "transcode": true) ffmpeg в контейнере перекодирует такой канал на лету: видео x264 ultrafast до 576 строк,
+# звук как есть. Одновременно — один канал: новый запрос (переключили канал) останавливает предыдущий.
+TC_LOCK = threading.Lock()
+TC_PROC = [None]
+
+
+def tc_install(cfg):
+    if not cfg.get("transcode") or shutil.which("ffmpeg") or not shutil.which("apk"):
+        return
+    def run():
+        r = subprocess.run(["apk", "add", "--no-cache", "ffmpeg"], capture_output=True, text=True)
+        log(f"ffmpeg для перекодирования: {'установлен' if r.returncode == 0 else r.stderr[-300:]}")
+    threading.Thread(target=run, daemon=True).start()
+
+
+def tc_local(url, ua, local):
+    return f"{local}/tc?u={quote(url, safe='')}" + (f"&ua={quote(ua, safe='')}" if ua else "")
+
+
+def tc_pump(url, ua, wfile):
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-user_agent", ua or DEFAULT_UA,
+           "-analyzeduration", "1000000", "-probesize", "1000000", "-i", url,   # старт быстрее: MPEG-2 в TS видно сразу
+           "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+           "-vf", "scale=-2:'min(576,ih)'", "-b:v", "2000k", "-maxrate", "2500k", "-bufsize", "2000k", "-g", "50",
+           "-c:a", "copy", "-f", "mpegts", "pipe:1"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with TC_LOCK:
+        old, TC_PROC[0] = TC_PROC[0], p
+    if old and old.poll() is None:
+        old.kill()
+    try:
+        shutil.copyfileobj(p.stdout, wfile, 65536)
+    finally:
+        p.kill()
+        err = p.stderr.read(400).decode("utf-8", "replace").strip()
+        p.wait()
+        if err and p is TC_PROC[0]:
+            log(f"перекодирование {url[:80]}: {err}")
+
+
 def wrap_master(url, ua=None, local=""):
     hit = W_CACHE.get(url)
     if hit and hit[1] > time.time():
@@ -1002,6 +1072,8 @@ class Agg:
         units = [dict(c, group=group(c)) for c in self.chans.values()]
         units += [{"key": k, "name": sc["name"], "group": sc["group"], "main": None, "cand": [], "tvg": {"logo": sc["logo"]}}
                   for k, sc in site.items() if k not in self.chans]
+        removed = {name_key(n) for n in self.cfg.get("removed_channels", [])}   # мёртвые везде, проверено на ТВ и с NAS
+        units = [c for c in units if name_key(c["name"]) not in removed]
 
         def key(c):   # раздел; внутри — порядок сайта, затем основные по каталогу, затем по алфавиту
             return (gorder.get(c["group"], 99), c["group"], spos.get(c["key"], 10 ** 6),
@@ -1049,6 +1121,10 @@ class Agg:
                     sm_keys.add(SM_URL.match(e["url"]).groups())
                 hls = bool(self.last[e["url"]].get("hls"))
                 u = e["url"]
+                vcodec = self.last[e["url"]].get("vcodec", "")
+                if vcodec == "mpeg2" and cfg.get("transcode") and shutil.which("ffmpeg") and not e["ref"]:
+                    streams.append({"url": tc_local(u, e["ua"] or "", local), "ua": "", "ref": "", "hls": False, "v": "h264"})
+                    continue
                 if hls and RELAY_HOSTS.search(urlsplit(u).hostname or ""):
                     u = kz_relay(u, kz_origin(u) + "/", local)
                 elif hls and not e["ref"] and tv_relay(u):
@@ -1294,6 +1370,18 @@ def serve(cfg):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 return self.wfile.write(body)
+            if self.path.startswith(("/ts?", "/tc?")):
+                q = parse_qs(urlsplit(self.path).query)
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp2t")
+                self.end_headers()
+                try:
+                    (tc_pump if self.path.startswith("/tc?") else ts_pump)(q["u"][0], q.get("ua", [None])[0], self.wfile)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass   # плеер переключил канал
+                except Exception as ex:
+                    log(f"ts {q.get('u', ['?'])[0][:80]}: {ex!r}")
+                return
             if self.path.startswith(("/w?", "/wv?")):
                 q = parse_qs(urlsplit(self.path).query)
                 ua = q.get("ua", [None])[0]
@@ -1448,6 +1536,7 @@ def main():
         agg.step("full")
         return
     threading.Thread(target=serve, args=(cfg,), daemon=True).start()
+    tc_install(cfg)
 
     def watchdog():
         """Проверка висит дольше step_max_min (сеть «залипла», поток не отдаёт таймаут) — выходим,
