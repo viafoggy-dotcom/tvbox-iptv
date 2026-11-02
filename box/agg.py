@@ -928,8 +928,18 @@ class Agg:
 
     def run_probes(self, items):
         """items: [(entry, seg_bytes)] — проверить параллельно и записать в историю."""
+        done, step, lock = [0], max(25, len(items) // 20), threading.Lock()
+
+        def one(it):   # большая проверка идёт минутами — в журнал ход (его видно на экране первой настройки)
+            r = probe(*it)
+            with lock:
+                done[0] += 1
+                if len(items) >= 200 and done[0] % step == 0:
+                    log(f"проверено потоков {done[0]} из {len(items)}")
+            return r
+
         with cf.ThreadPoolExecutor(self.cfg.get("workers", 12)) as ex:
-            res = list(ex.map(lambda it: probe(*it), items))
+            res = list(ex.map(one, items))
         for (e, _), r in zip(items, res):
             u = e["url"]
             prev = self.last.get(u, {})
